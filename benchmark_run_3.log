@@ -1,0 +1,50 @@
+Firing 30 prompts at http://localhost:8000/chat ...
+
+[ 1/30] MISS  model=qwen2.5:1.5b   latency=   1771.7ms  (wall=   3817.4ms)  What is the capital of Japan?
+[ 2/30] MISS  model=qwen2.5:3b     latency=  76270.6ms  (wall=  76294.7ms)  Explain how photosynthesis works in plants.
+[ 3/30] MISS  model=qwen2.5:1.5b   latency=   2688.5ms  (wall=   2707.3ms)  What is 15 times 7?
+[ 4/30] HIT   model=cache          latency=     43.2ms  (wall=     63.1ms)  What's the capital city of Japan?
+[ 5/30] MISS  model=qwen2.5:1.5b   latency=   1982.9ms  (wall=   1999.9ms)  Name three primary colors.
+[ 6/30] MISS  model=qwen2.5:3b     latency=  84620.1ms  (wall=  84641.4ms)  Compare the advantages and disadvantages of remote work vers
+[ 7/30] MISS  model=qwen2.5:1.5b   latency=   3680.7ms  (wall=   3705.2ms)  What is the largest planet in our solar system?
+[ 8/30] MISS  model=qwen2.5:3b     latency=  39104.5ms  (wall=  39129.0ms)  Why do seasons change throughout the year?
+[ 9/30] HIT   model=cache          latency=     56.9ms  (wall=     77.4ms)  Can you tell me Japan's capital?
+[10/30] MISS  model=qwen2.5:1.5b   latency=   9843.9ms  (wall=   9875.0ms)  What year did World War II end?
+[11/30] MISS  model=qwen2.5:3b     latency=  78257.7ms  (wall=  78279.1ms)  What are the pros and cons of remote work compared to workin
+[12/30] MISS  model=qwen2.5:1.5b   latency=   2578.4ms  (wall=   2610.1ms)  What is the chemical symbol for gold?
+[13/30] HIT   model=cache          latency=     38.7ms  (wall=     54.5ms)  Which planet is the biggest in our solar system?
+[14/30] MISS  model=qwen2.5:3b     latency= 103232.8ms  (wall= 103285.9ms)  What are the steps to bake a basic loaf of bread from scratc
+[15/30] MISS  model=qwen2.5:1.5b   latency=   2373.4ms  (wall=   2396.9ms)  List the days of the week.
+[16/30] MISS  model=qwen2.5:3b     latency= 111327.3ms  (wall= 111349.8ms)  Can you explain the process of photosynthesis in plants?
+[17/30] MISS  model=qwen2.5:1.5b   latency=   1886.3ms  (wall=   1903.6ms)  Translate 'hello' to Spanish.
+[18/30] MISS  model=qwen2.5:3b     latency=  73359.3ms  (wall=  73383.6ms)  Analyze the causes of the fall of the Roman Empire.
+[19/30] HIT   model=cache          latency=    200.8ms  (wall=    229.2ms)  Tell me the largest planet in the solar system.
+[20/30] MISS  model=qwen2.5:3b     latency=  21895.6ms  (wall=  21919.3ms)  Summarize the plot of Romeo and Juliet in a few sentences.
+[21/30] MISS  model=qwen2.5:3b     latency=  72005.4ms  (wall=  72087.9ms)  What is the difference between machine learning and deep lea
+[22/30] HIT   model=cache          latency=     61.1ms  (wall=     83.6ms)  What's Japan's capital city called?
+[23/30] MISS  model=qwen2.5:3b     latency=  85113.6ms  (wall=  85178.1ms)  Evaluate the pros and cons of electric vehicles compared to 
+[24/30] MISS  model=qwen2.5:3b     latency=  45813.4ms  (wall=  45883.3ms)  How does photosynthesis work?
+[25/30] MISS  model=qwen2.5:1.5b   latency=   4098.7ms  (wall=   4157.1ms)  What is the tallest mountain in the world?
+[26/30] MISS  model=qwen2.5:3b     latency=  81087.8ms  (wall=  81189.2ms)  I've been thinking about switching careers into software eng
+[27/30] MISS  model=qwen2.5:1.5b   latency=   2246.1ms  (wall=   2266.5ms)  What is the boiling point of water in Celsius?
+[28/30] HIT   model=cache          latency=    149.7ms  (wall=    258.8ms)  How do seasons change during the year?
+[29/30] MISS  model=qwen2.5:1.5b   latency=   4096.2ms  (wall=   4116.9ms)  What's the highest mountain on Earth?
+[30/30] MISS  model=qwen2.5:3b     latency=  60015.7ms  (wall=  60034.4ms)  Contrast the benefits of solar power and wind power for home
+
+============================================================
+                     BENCHMARK SUMMARY                      
+============================================================
+Total requests                                            30
+Cache hits                                                 6
+Cache misses                                              24
+Cache hit rate                                         20.0%
+------------------------------------------------------------
+Avg latency - cache hits                            91.7 ms
+Avg latency - cache misses                       40389.6 ms
+Speedup (miss / hit)                                 440.3x
+------------------------------------------------------------
+Avg latency by model_used:
+  cache                      n=6     avg=      91.7 ms
+  qwen2.5:1.5b               n=11    avg=    3386.1 ms
+  qwen2.5:3b                 n=13    avg=   71700.3 ms
+============================================================

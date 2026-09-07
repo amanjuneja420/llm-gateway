@@ -1,0 +1,17 @@
+venv/
+__pycache__/
+*.pyc
+.env
+
+# Claude Code local session/tooling state - not part of the project
+.claude/
+
+# Raw uvicorn stdout dumps and orchestration output - incidental local
+# artifacts, not deliberate evidence (that's benchmark_run_*.log, which is
+# our own controlled print format). Excluded because uvicorn logs full
+# local Python tracebacks (absolute file paths) on any server-side
+# exception by default - server_run_2.log leaked exactly that before this
+# rule existed.
+server_run_*.log
+server.log
+three_runs_orchestrator.log
