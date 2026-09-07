@@ -32,10 +32,19 @@ def init_db(db_path: str = DB_PATH) -> None:
                 latency_ms REAL NOT NULL,
                 load_duration_ms REAL,
                 eval_count INTEGER,
-                eval_duration_ms REAL
+                eval_duration_ms REAL,
+                failed_over INTEGER NOT NULL DEFAULT 0
             )
             """
         )
+        # Migrate a gateway.db created before failed_over existed (e.g. the
+        # Run 3 snapshot committed to the repo) instead of silently having
+        # new code fail against an old schema.
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(requests)")}
+        if "failed_over" not in existing_cols:
+            conn.execute(
+                "ALTER TABLE requests ADD COLUMN failed_over INTEGER NOT NULL DEFAULT 0"
+            )
         conn.commit()
     finally:
         conn.close()
@@ -49,22 +58,25 @@ def log_request(
     load_duration_ms: float | None = None,
     eval_count: int | None = None,
     eval_duration_ms: float | None = None,
+    failed_over: bool = False,
     db_path: str = DB_PATH,
 ) -> None:
     """Log one request. model_used is 'cache' on a cache hit, otherwise the
-    actual Ollama model name (e.g. 'qwen2.5:1.5b'). load_duration_ms,
-    eval_count, and eval_duration_ms come straight from Ollama's own
-    response payload and are left NULL on cache hits, since no model call
-    was made."""
+    actual backend that produced the response (e.g. 'qwen2.5:1.5b' or, on
+    failover, 'gemini-1.5-flash'). load_duration_ms, eval_count, and
+    eval_duration_ms come straight from Ollama's own response payload and
+    are left NULL on cache hits and on failover (Gemini doesn't report
+    these). failed_over is True only when the routed local Ollama call
+    failed and this request was retried against Gemini instead."""
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
             """
             INSERT INTO requests (
                 timestamp, prompt, model_used, cache_hit, latency_ms,
-                load_duration_ms, eval_count, eval_duration_ms
+                load_duration_ms, eval_count, eval_duration_ms, failed_over
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 datetime.now(timezone.utc).isoformat(),
@@ -75,6 +87,7 @@ def log_request(
                 load_duration_ms,
                 eval_count,
                 eval_duration_ms,
+                int(failed_over),
             ),
         )
         conn.commit()

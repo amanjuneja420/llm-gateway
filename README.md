@@ -2,12 +2,15 @@
 
 A scoped-down local LLM gateway: one FastAPI endpoint that routes prompts between two
 local Ollama models with a heuristic, semantically caches similar prompts to skip
-redundant model calls, and logs every request to SQLite. Built and tested entirely
-against local Ollama models on a CPU-only Windows machine — no cloud APIs, no GPU.
+redundant model calls, logs every request to SQLite, and fails over to Gemini
+(cloud) if the routed local model call fails. Built and tested primarily against
+local Ollama models on a CPU-only Windows machine — no GPU — with Gemini as the one
+cloud dependency, used only as a fallback.
 
 **Explicitly out of scope** (by design, not by omission): rate limiting, Redis/Postgres,
-circuit breakers/failover, load balancing across replicas, streaming responses,
-Docker/Kubernetes, a trained ML router, any UI/dashboard.
+a full circuit-breaker state machine (see "Gemini failover" below for what's actually
+implemented instead - simple, not stateful), load balancing across replicas, streaming
+responses, Docker/Kubernetes, a trained ML router, any UI/dashboard.
 
 ## Architecture
 
@@ -28,6 +31,8 @@ Docker/Kubernetes, a trained ML router, any UI/dashboard.
            no model call)                       |
                     |                            v
                     |                  4. Call Ollama /api/generate
+                    |                       (fails? -> 4b. call Gemini instead,
+                    |                        failed_over=true - see below)
                     |                            |
                     |                            v
                     |                  5. Store (embedding, prompt,
@@ -39,19 +44,21 @@ Docker/Kubernetes, a trained ML router, any UI/dashboard.
                     6. Log request to SQLite (gateway.db)
                                   |
                                   v
-                    Return {response, model_used, cache_hit, latency_ms}
+        Return {response, model_used, cache_hit, latency_ms, failed_over}
 ```
 
-Four small modules, each independently runnable/testable:
+Small modules, each independently runnable/testable:
 
 - [`router.py`](router.py) — the heuristic model router (no I/O, pure function)
 - [`cache.py`](cache.py) — the semantic cache (embedding + cosine similarity)
 - [`db.py`](db.py) — SQLite schema + logging helper
-- [`main.py`](main.py) — FastAPI app that wires the three together behind `POST /chat`
+- [`main.py`](main.py) — FastAPI app that wires the router, cache, Ollama, and Gemini failover together behind `POST /chat`
 - [`benchmark.py`](benchmark.py) — standalone load/test script, run manually against the live server
 - [`analyze_ollama_stats.py`](analyze_ollama_stats.py) — standalone analysis script, breaks down Ollama's own load/eval timing per model from `gateway.db`
 - [`aggregate_benchmark_runs.py`](aggregate_benchmark_runs.py) — combines several `benchmark.py` runs' printed summaries into one table with min/max/avg speedup and hit rate
+- [`test_failover.py`](test_failover.py) — standalone test script for the Gemini failover path, run manually
 - `runs/` — raw `gateway.db` snapshot from each `benchmark.py` run (`gateway_run_<UTC timestamp>.db`), archived automatically before the next run wipes the live `gateway.db`
+- `.env` (not committed, see `.env.example`) — holds `GEMINI_API_KEY`, loaded at startup via `python-dotenv`
 
 ## The routing heuristic — and why it's a heuristic, not a trained model
 
@@ -107,6 +114,96 @@ country, different attribute) won't incorrectly hit the cache, low enough that r
 paraphrasing reliably hits. It's a single named constant at the top of `cache.py`, so
 it's trivial to retune if more data suggests otherwise.
 
+## Gemini failover
+
+The gateway's two Ollama models are the primary backends; Gemini is a **cloud
+fallback for when the routed local call fails**, not a third routing option the
+heuristic ever picks directly.
+
+**What counts as a failure, precisely:** in `chat()`, the call to `call_ollama()` is
+wrapped in a bare `except Exception`. This catches everything the local call can
+throw, including:
+- A timeout past `OLLAMA_TIMEOUT_SECONDS = 120.0` (the same constant `call_ollama`'s
+  own `httpx.AsyncClient` already used for its timeout - failover reuses it rather
+  than introducing a second, different threshold to reason about). httpx raises
+  `ConnectTimeout` or `ReadTimeout` in this case.
+- A connection failure (Ollama not running, wrong port, network refused) -
+  `httpx.ConnectError`.
+- An HTTP error status from Ollama itself (`resp.raise_for_status()` raising
+  `HTTPStatusError` on a 4xx/5xx).
+- Any other exception the call raises, on the theory that "local call didn't produce
+  a usable response" should fail over regardless of the exact exception type.
+
+On any of the above, the *same request* (same prompt) is immediately retried against
+`GEMINI_MODEL` (currently `gemini-3.8-flash` - see the note in `main.py` on why not
+the originally planned `gemini-1.5-flash`, which is deprecated and 404s on the live
+API). The response is returned normally, with `model_used` set to the Gemini model
+name and a new `failed_over: true` field on `ChatResponse`. `db.py` logs
+`failed_over` as its own column (0/1) on every request, so failovers are queryable
+after the fact, not just visible in the moment.
+
+**This is explicitly not a circuit breaker.** There's no failure counter, no
+open/half-open/closed state, no cooldown window before trying Ollama again. Every
+request independently tries the local model first; only that one request's failure
+decides whether it falls back to Gemini. If Ollama recovers a millisecond later, the
+very next request goes straight back to it. A real circuit breaker (trip after N
+consecutive failures, stop even trying the local model for a cooldown period, half-open
+probe requests) is meaningfully more machinery than this MVP's time box covers, and is
+called out explicitly in this README's scope, not silently skipped.
+
+**Security note on the API key:** `call_gemini()` sends `GEMINI_API_KEY` as the
+`x-goog-api-key` HTTP header, never as a URL query parameter. httpx exceptions (and
+anything that logs them) include the request URL in their message - a key-in-URL
+would leak the secret into ordinary error output the moment a Gemini call ever
+failed. A header never appears in that message.
+
+**Setup:** copy `.env.example` to `.env` and put a real key in it:
+```bash
+copy .env.example .env
+```
+Then edit `.env` and replace `your_key_here` with a real Gemini API key. `.env` is
+gitignored and is never committed; `main.py` loads it at startup via
+`python-dotenv`'s `load_dotenv()`.
+
+**Verification ([`test_failover.py`](test_failover.py)):** imports `main.py` directly
+(no live server needed) so it can monkeypatch `main.OLLAMA_URL` to an unreachable port
+for exactly one call, simulating a local failure without touching the real Ollama
+service. Real output from an actual run, key redacted from nothing because the script
+never prints it:
+
+```
+=== Test 1: normal request through Ollama (should be unaffected) ===
+PASS - model_used=qwen2.5:1.5b  cache_hit=False  failed_over=False  latency_ms=1283.1
+
+=== Test 2: simulated local failure -> Gemini failover ===
+Ollama call failed (ConnectError: All connection attempts failed) - failing over to Gemini
+PASS - model_used=gemini-3.8-flash  failed_over=True  latency_ms=5629.9
+Gemini response (truncated): 'Europa'
+
+=== Verifying failed_over=1 was actually logged to gateway.db ===
+PASS - row id=34  model_used=gemini-3.8-flash  failed_over=1  latency_ms=5629.9  prompt='Name one moon of Jupiter, for the failover test.'
+
+============================================================
+FAILOVER TEST SUMMARY
+============================================================
+  PASS   normal request
+  PASS   gemini failover
+  PASS   db logging
+============================================================
+```
+
+Note the path this took to get here: the first run of this test correctly detected
+the simulated failure and correctly attempted failover, but failed at the last step
+with `GEMINI_API_KEY is not set` (no `.env` existed yet) - itself useful evidence
+that the failure-detection and failover-attempt logic work independently of whether
+Gemini itself succeeds. The second run, still with the originally planned
+`gemini-1.5-flash`, got as far as a real HTTP call to Gemini and back a `404 Not
+Found` - that model has been deprecated since this project was scoped, confirmed by
+querying `GET /v1beta/models` for this key and finding it absent from the list. Only
+after switching to `gemini-3.8-flash` did the full path succeed end to end. All three
+states are reported here rather than only the final passing one, because a debugging
+path that actually happened is more honest evidence than a clean run that skips it.
+
 ## How to run
 
 All commands from the project root (`llm-gateway/`), using the existing venv.
@@ -117,14 +214,30 @@ ollama list
 # should show qwen2.5:1.5b and qwen2.5:3b
 ```
 
-**2. Start the gateway server:**
+**2. (Optional, only needed for Gemini failover) Set up `.env`:**
+```bash
+copy .env.example .env
+```
+Edit `.env` and put a real Gemini API key in place of `your_key_here`. Without this,
+everything except the Gemini failover path works exactly the same - a failed local
+call will itself fail (with a clear "GEMINI_API_KEY is not set" error) instead of
+successfully failing over.
+
+**3. Start the gateway server:**
 ```bash
 venv\Scripts\python -m uvicorn main:app --port 8000
 ```
 First startup takes ~20-25s while the embedding model loads into memory. Leave this
 running in its own terminal.
 
-**3. In a second terminal, run the benchmark:**
+**4. (Optional) Verify the Gemini failover path:**
+```bash
+venv\Scripts\python test_failover.py
+```
+Imports `main.py` directly rather than hitting the live server - see "Gemini
+failover" above for what it checks and its real output.
+
+**5. In a second terminal, run the benchmark:**
 ```bash
 venv\Scripts\python benchmark.py
 ```
@@ -135,14 +248,14 @@ for cache hits vs. misses, and average latency broken down by which model handle
 each request. That printed block is the real, reproducible number set for this
 project — see the run below.
 
-**4. (Optional) Break down Ollama's own load/eval timing per model:**
+**6. (Optional) Break down Ollama's own load/eval timing per model:**
 ```bash
 venv\Scripts\python analyze_ollama_stats.py
 ```
 Answers whether a slow model is due to reload overhead (`load_duration_ms`) or
 genuine token-generation time (`eval_duration_ms`) — see the section below.
 
-**5. (Optional) Inspect the raw log directly:**
+**7. (Optional) Inspect the raw log directly:**
 ```bash
 venv\Scripts\python -c "import sqlite3; [print(r) for r in sqlite3.connect('gateway.db').execute('SELECT * FROM requests ORDER BY id')]"
 ```

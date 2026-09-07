@@ -5,3 +5,4 @@ sentence-transformers==6.0.1
 numpy==2.5.3
 pydantic==2.13.5
 torch==2.14.0
+python-dotenv==1.2.3
