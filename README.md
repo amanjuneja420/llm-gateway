@@ -23,7 +23,7 @@ flowchart TD
     F --> H{"Call succeeds?"}
     G --> H
     H -->|"yes"| I["Store in cache"]
-    H -->|"no: exception or timeout"| J["Failover to Gemini<br/>(gemini-3.8-flash)"]
+    H -->|"no: exception or timeout"| J["Failover to Gemini<br/>(gemini-2.5-flash)"]
     J --> I
     I --> K["Log to SQLite (gateway.db)"]
     D --> K
