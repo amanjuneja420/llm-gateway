@@ -13,12 +13,21 @@ MVP / demo-sized cache (dozens to low thousands of entries) and keeps the
 whole thing inspectable in about 60 lines.
 """
 
+import json
+import os
 from dataclasses import dataclass
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+# Where the cache persists itself to disk. Two files, not one: embeddings go
+# in a numpy .npz (they're the only part that benefits from numpy's binary
+# format), and the parallel text fields go in a plain JSON sidecar. No
+# pickle - a corrupt or tampered pickle file can execute arbitrary code on
+# load; JSON + npz can't.
+CACHE_STATE_PATH = "cache_state"
 
 # Cosine similarity cutoff above which a cached response is considered a
 # match for a new prompt. Started at 0.92: with all-MiniLM-L6-v2, genuine
@@ -94,6 +103,51 @@ class SemanticCache:
         self._models_used.append(model_used)
 
     def __len__(self) -> int:
+        return len(self._prompts)
+
+    def save(self, path: str = CACHE_STATE_PATH) -> int:
+        """
+        Persist the cache to <path>.npz (embeddings, stacked into one
+        matrix) and <path>.json (the parallel prompt/response/model_used
+        lists). Called on server shutdown so the cache survives a restart
+        instead of starting empty every time. Returns the number of
+        entries saved (0 and no files written if the cache is empty).
+        """
+        if not self._embeddings:
+            return 0
+        matrix = np.vstack(self._embeddings)
+        np.savez(f"{path}.npz", embeddings=matrix)
+        with open(f"{path}.json", "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "prompts": self._prompts,
+                    "responses": self._responses,
+                    "models_used": self._models_used,
+                },
+                f,
+            )
+        return len(self._prompts)
+
+    def load(self, path: str = CACHE_STATE_PATH) -> int:
+        """
+        Reload a previously saved cache from <path>.npz / <path>.json, if
+        both exist. Called on startup. Returns the number of entries
+        loaded (0 if no saved state was found, leaving the cache empty
+        exactly as it was before this method existed).
+        """
+        npz_path, json_path = f"{path}.npz", f"{path}.json"
+        if not (os.path.exists(npz_path) and os.path.exists(json_path)):
+            return 0
+
+        with np.load(npz_path) as data:
+            matrix = data["embeddings"]
+        with open(json_path, encoding="utf-8") as f:
+            text_data = json.load(f)
+
+        self._embeddings = list(matrix)
+        self._prompts = text_data["prompts"]
+        self._responses = text_data["responses"]
+        self._models_used = text_data["models_used"]
         return len(self._prompts)
 
 

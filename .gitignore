@@ -15,3 +15,9 @@ __pycache__/
 server_run_*.log
 server.log
 three_runs_orchestrator.log
+
+# Semantic cache persistence (Phase 1d) - fluctuates on every request and
+# every restart, unlike gateway.db's deliberately curated Run 3 snapshot.
+# Not meaningful as committed evidence, just local runtime state.
+cache_state.npz
+cache_state.json

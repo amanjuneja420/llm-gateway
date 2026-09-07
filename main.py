@@ -7,19 +7,20 @@ to skip redundant model calls (see cache.py), logs every request to SQLite
 (see db.py), and fails over to Gemini if the routed local Ollama call fails
 (see call_gemini and chat() below).
 
-Section 4 status: heuristic routing + semantic cache + SQLite logging all
-wired in. This is the complete gateway; benchmark.py (section 5) exercises
-it and reports real numbers. Gemini failover is additive on top of that -
-see the README's "Gemini failover" section for exactly what counts as a
-failure.
+Phase 1 additions on top of that: a GET /health endpoint, a per-request
+correlation ID threaded through the cache/router/model-call/log path, input
+validation on the prompt, and cache persistence across restarts (see
+lifespan() below and cache.py's save()/load()).
 """
 
 import os
 import time
+import uuid
+from contextlib import asynccontextmanager
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from cache import SemanticCache
@@ -29,28 +30,72 @@ from router import route
 load_dotenv()  # reads .env in the project root, if present; no-op otherwise
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
+# Lightweight reachability check for /health - lists local models instead of
+# running a real generation, so it doesn't cost CPU time or tie up a model.
+OLLAMA_TAGS_URL = "http://localhost:11434/api/tags"
 # Also the failover trigger threshold: any Ollama call that runs past this
 # many seconds (or raises any other exception) counts as a failure and gets
 # retried against Gemini - see chat() below.
 OLLAMA_TIMEOUT_SECONDS = 120.0
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-# gemini-1.5-flash (the originally planned model) has been deprecated and no
-# longer exists on the live API - confirmed by querying
-# https://generativelanguage.googleapis.com/v1beta/models for this key,
-# which 404s on gemini-1.5-flash but lists gemini-3.8-flash as available.
-GEMINI_MODEL = "gemini-3.8-flash"
+# Model selection history, in order:
+#   1. gemini-1.5-flash (originally planned) - deprecated, 404s on the live
+#      API. Confirmed by querying https://generativelanguage.googleapis.com
+#      /v1beta/models for this key and finding it absent from the list.
+#   2. gemini-3.1-flash (considered next, on the assumption a newer point
+#      release would exist) - does NOT exist on the live API either.
+#      Confirmed the same way: absent from /v1beta/models. Only
+#      gemini-3.1-flash-lite/-lite-preview/-image/-image-preview/-tts-preview
+#      exist under the 3.1 line, not a plain gemini-3.1-flash.
+#   3. gemini-3.8-flash (newest flash model actually in the list) - exists,
+#      but unreliable in real testing: 4 of 6 real generateContent calls
+#      across two separate testing sessions returned 503 Service
+#      Unavailable (likely an overloaded/rate-limited preview-tier model).
+#   4. gemini-2.5-flash (chosen) - 4 of 4 real generateContent calls
+#      succeeded across the same testing sessions. This is the failover
+#      backend for when the local model has already failed, so a model
+#      that reliably answers beats a newer one that occasionally doesn't -
+#      picked on that basis, not because it's the newest available.
+GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 )
+# Same models-list endpoint used to pick GEMINI_MODEL above, reused here as
+# the cheap reachability check for /health (lists models instead of
+# generating anything).
+GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_TIMEOUT_SECONDS = 60.0
 
-app = FastAPI(title="LLM Gateway MVP")
+# /health uses a short timeout of its own - it should fail fast, not wait
+# anywhere near as long as a real generation call would.
+HEALTH_CHECK_TIMEOUT_SECONDS = 5.0
+
+# Prompts longer than this are rejected with 400 rather than silently
+# accepted and passed to a model. 2000 chars is generous for the kind of
+# short-to-medium prompts this gateway is exercised with (the benchmark's
+# longest prompt is well under 300 chars) while still catching obviously
+# oversized/malformed input.
+MAX_PROMPT_LENGTH = 2000
 
 # Loaded once at startup - loading the sentence-transformer per request would
 # dominate latency and defeat the point of caching.
 cache = SemanticCache()
-init_db()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    loaded = cache.load()
+    if loaded:
+        print(f"Loaded {loaded} cache entries from disk (cache_state.json/.npz)")
+    yield
+    saved = cache.save()
+    if saved:
+        print(f"Saved {saved} cache entries to disk (cache_state.json/.npz)")
+
+
+app = FastAPI(title="LLM Gateway MVP", lifespan=lifespan)
 
 
 class ChatRequest(BaseModel):
@@ -63,6 +108,7 @@ class ChatResponse(BaseModel):
     cache_hit: bool
     latency_ms: float
     failed_over: bool = False
+    request_id: str
 
 
 async def call_ollama(model: str, prompt: str) -> dict:
@@ -114,19 +160,73 @@ async def call_gemini(prompt: str) -> str:
         return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
+@app.get("/health")
+async def health() -> dict:
+    """
+    Lightweight reachability check for both backends - lists models rather
+    than generating anything, so it's fast and doesn't cost CPU/quota.
+    Doesn't touch the cache, router, or DB; this is purely "can we reach
+    these two services right now".
+    """
+    ollama_status = "down"
+    try:
+        async with httpx.AsyncClient(timeout=HEALTH_CHECK_TIMEOUT_SECONDS) as client:
+            resp = await client.get(OLLAMA_TAGS_URL)
+            if resp.status_code == 200:
+                ollama_status = "up"
+    except Exception:
+        ollama_status = "down"
+
+    if not GEMINI_API_KEY:
+        gemini_status = "unconfigured"
+    else:
+        gemini_status = "down"
+        try:
+            async with httpx.AsyncClient(timeout=HEALTH_CHECK_TIMEOUT_SECONDS) as client:
+                resp = await client.get(
+                    GEMINI_MODELS_URL, headers={"x-goog-api-key": GEMINI_API_KEY}
+                )
+                if resp.status_code == 200:
+                    gemini_status = "up"
+        except Exception:
+            gemini_status = "down"
+
+    return {
+        "gateway": "up",
+        "ollama": ollama_status,
+        "gemini": gemini_status,
+        "cache_size": len(cache),
+    }
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
+    # Generated once per request and carried through every observable
+    # artifact of handling it - the DB log row and the response itself, plus
+    # any print() emitted along the way (see the failover branch below) - so
+    # one request's full path through the system can be traced by grepping
+    # for this one value.
+    request_id = str(uuid.uuid4())
     start = time.perf_counter()
+
+    if not req.prompt or not req.prompt.strip():
+        raise HTTPException(status_code=400, detail="prompt must not be empty or whitespace-only")
+    if len(req.prompt) > MAX_PROMPT_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"prompt exceeds MAX_PROMPT_LENGTH ({MAX_PROMPT_LENGTH} chars)",
+        )
 
     cached_entry, query_embedding = cache.find(req.prompt)
     if cached_entry is not None:
         latency_ms = (time.perf_counter() - start) * 1000
-        log_request(req.prompt, "cache", True, latency_ms)
+        log_request(req.prompt, "cache", True, latency_ms, request_id=request_id)
         return ChatResponse(
             response=cached_entry.response,
             model_used="cache",
             cache_hit=True,
             latency_ms=latency_ms,
+            request_id=request_id,
         )
 
     model_used = route(req.prompt)
@@ -154,12 +254,22 @@ async def chat(req: ChatRequest) -> ChatResponse:
         # refused, HTTP 4xx/5xx from Ollama) and a timeout past
         # OLLAMA_TIMEOUT_SECONDS (httpx raises ReadTimeout/ConnectTimeout,
         # both plain exceptions here, once that threshold is hit).
-        print(f"Ollama call failed ({type(exc).__name__}: {exc}) - failing over to Gemini")
+        print(
+            f"[{request_id}] Ollama call failed ({type(exc).__name__}: {exc}) "
+            "- failing over to Gemini"
+        )
         response_text = await call_gemini(req.prompt)
         model_used = GEMINI_MODEL
         failed_over = True
 
     cache.add(req.prompt, query_embedding, response_text, model_used)
+    # Persist immediately rather than only on clean shutdown (see lifespan()
+    # above) - a crash or force-kill doesn't fire ASGI shutdown handlers, and
+    # in practice that's exactly when you'd most want the cache not to be
+    # lost. At this cache's demo scale (dozens to low hundreds of entries),
+    # rewriting the whole file after every new entry is cheap enough not to
+    # matter for latency.
+    cache.save()
 
     latency_ms = (time.perf_counter() - start) * 1000
     log_request(
@@ -171,6 +281,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
         eval_count=eval_count,
         eval_duration_ms=eval_duration_ms,
         failed_over=failed_over,
+        request_id=request_id,
     )
 
     return ChatResponse(
@@ -179,4 +290,5 @@ async def chat(req: ChatRequest) -> ChatResponse:
         cache_hit=False,
         latency_ms=latency_ms,
         failed_over=failed_over,
+        request_id=request_id,
     )

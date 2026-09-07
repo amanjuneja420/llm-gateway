@@ -18,6 +18,17 @@ DB_PATH = "gateway.db"
 PROMPT_LOG_CHARS = 200
 
 
+# Columns added after the table's original CREATE, each migrated in
+# non-destructively below if an older gateway.db (e.g. the Run 3 snapshot
+# committed to the repo) doesn't have them yet. Keeping this as a dict makes
+# adding the next column later a one-line change instead of a new ad hoc
+# ALTER TABLE block.
+_MIGRATED_COLUMNS = {
+    "failed_over": "INTEGER NOT NULL DEFAULT 0",
+    "request_id": "TEXT",
+}
+
+
 def init_db(db_path: str = DB_PATH) -> None:
     conn = sqlite3.connect(db_path)
     try:
@@ -33,18 +44,15 @@ def init_db(db_path: str = DB_PATH) -> None:
                 load_duration_ms REAL,
                 eval_count INTEGER,
                 eval_duration_ms REAL,
-                failed_over INTEGER NOT NULL DEFAULT 0
+                failed_over INTEGER NOT NULL DEFAULT 0,
+                request_id TEXT
             )
             """
         )
-        # Migrate a gateway.db created before failed_over existed (e.g. the
-        # Run 3 snapshot committed to the repo) instead of silently having
-        # new code fail against an old schema.
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(requests)")}
-        if "failed_over" not in existing_cols:
-            conn.execute(
-                "ALTER TABLE requests ADD COLUMN failed_over INTEGER NOT NULL DEFAULT 0"
-            )
+        for column, sql_type in _MIGRATED_COLUMNS.items():
+            if column not in existing_cols:
+                conn.execute(f"ALTER TABLE requests ADD COLUMN {column} {sql_type}")
         conn.commit()
     finally:
         conn.close()
@@ -59,6 +67,7 @@ def log_request(
     eval_count: int | None = None,
     eval_duration_ms: float | None = None,
     failed_over: bool = False,
+    request_id: str | None = None,
     db_path: str = DB_PATH,
 ) -> None:
     """Log one request. model_used is 'cache' on a cache hit, otherwise the
@@ -67,16 +76,20 @@ def log_request(
     eval_duration_ms come straight from Ollama's own response payload and
     are left NULL on cache hits and on failover (Gemini doesn't report
     these). failed_over is True only when the routed local Ollama call
-    failed and this request was retried against Gemini instead."""
+    failed and this request was retried against Gemini instead. request_id
+    is the UUID main.py generated for this request - the same value it
+    returns in the response - so this row can be matched back to a specific
+    request instead of just a timestamp."""
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
             """
             INSERT INTO requests (
                 timestamp, prompt, model_used, cache_hit, latency_ms,
-                load_duration_ms, eval_count, eval_duration_ms, failed_over
+                load_duration_ms, eval_count, eval_duration_ms, failed_over,
+                request_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 datetime.now(timezone.utc).isoformat(),
@@ -88,6 +101,7 @@ def log_request(
                 eval_count,
                 eval_duration_ms,
                 int(failed_over),
+                request_id,
             ),
         )
         conn.commit()
