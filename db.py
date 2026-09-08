@@ -26,6 +26,7 @@ PROMPT_LOG_CHARS = 200
 _MIGRATED_COLUMNS = {
     "failed_over": "INTEGER NOT NULL DEFAULT 0",
     "request_id": "TEXT",
+    "served_by": "TEXT",
 }
 
 
@@ -45,7 +46,8 @@ def init_db(db_path: str = DB_PATH) -> None:
                 eval_count INTEGER,
                 eval_duration_ms REAL,
                 failed_over INTEGER NOT NULL DEFAULT 0,
-                request_id TEXT
+                request_id TEXT,
+                served_by TEXT
             )
             """
         )
@@ -68,18 +70,23 @@ def log_request(
     eval_duration_ms: float | None = None,
     failed_over: bool = False,
     request_id: str | None = None,
+    served_by: str | None = None,
     db_path: str = DB_PATH,
 ) -> None:
     """Log one request. model_used is 'cache' on a cache hit, otherwise the
-    actual backend that produced the response (e.g. 'qwen2.5:1.5b' or, on
-    failover, 'gemini-1.5-flash'). load_duration_ms, eval_count, and
-    eval_duration_ms come straight from Ollama's own response payload and
-    are left NULL on cache hits and on failover (Gemini doesn't report
-    these). failed_over is True only when the routed local Ollama call
-    failed and this request was retried against Gemini instead. request_id
-    is the UUID main.py generated for this request - the same value it
-    returns in the response - so this row can be matched back to a specific
-    request instead of just a timestamp."""
+    actual model name that produced the response (e.g. 'qwen2.5:1.5b',
+    'gemini-2.5-flash', or 'openai/gpt-oss-20b' on Groq). load_duration_ms,
+    eval_count, and eval_duration_ms come from the backend's own response
+    where it reports them (Ollama: all three; Groq: eval_count and
+    eval_duration_ms; Gemini: neither) and are NULL otherwise. failed_over
+    is True whenever served_by isn't "ollama" - kept for backward
+    compatibility with the simpler two-tier Phase 1 framing. served_by is
+    the more precise field: "ollama" | "gemini" | "groq" | "cache",
+    recording which backend in the three-tier failover chain actually
+    served this response. request_id is the UUID main.py generated for
+    this request - the same value it returns in the response - so this row
+    can be matched back to a specific request instead of just a
+    timestamp."""
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
@@ -87,9 +94,9 @@ def log_request(
             INSERT INTO requests (
                 timestamp, prompt, model_used, cache_hit, latency_ms,
                 load_duration_ms, eval_count, eval_duration_ms, failed_over,
-                request_id
+                request_id, served_by
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 datetime.now(timezone.utc).isoformat(),
@@ -102,6 +109,7 @@ def log_request(
                 eval_duration_ms,
                 int(failed_over),
                 request_id,
+                served_by,
             ),
         )
         conn.commit()

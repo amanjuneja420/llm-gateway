@@ -4,13 +4,24 @@ LLM Gateway MVP
 Single-endpoint FastAPI gateway that routes prompts between two local Ollama
 models using a heuristic (see router.py), semantically caches similar prompts
 to skip redundant model calls (see cache.py), logs every request to SQLite
-(see db.py), and fails over to Gemini if the routed local Ollama call fails
-(see call_gemini and chat() below).
+(see db.py), and fails over through a three-tier chain - Ollama, then
+Gemini, then Groq - if the routed local call fails (see backends.py's
+Backend classes and chat() below).
 
 Phase 1 additions on top of that: a GET /health endpoint, a per-request
 correlation ID threaded through the cache/router/model-call/log path, input
 validation on the prompt, and cache persistence across restarts (see
 lifespan() below and cache.py's save()/load()).
+
+Phase 2: call_ollama()/call_gemini() were pulled out into backends.py as
+OllamaBackend/GeminiBackend, both implementing the same Backend interface
+(generate(prompt) -> BackendResponse) - a pure refactor, chat()'s behavior
+was unchanged by it. Groq was then added as a third backend and the
+failover chain extended to try all three in order, stopping at the first
+success (see the loop in chat() below) and returning 502 only if all three
+fail. served_by ("ollama"/"gemini"/"groq"/"cache") records which one
+actually answered; failed_over is just served_by != "ollama", kept for
+backward compatibility with Phase 1's simpler two-tier framing.
 """
 
 import os
@@ -23,6 +34,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from backends import GeminiBackend, GroqBackend, OllamaBackend
 from cache import SemanticCache
 from db import init_db, log_request
 from router import route
@@ -58,14 +70,33 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 #      that reliably answers beats a newer one that occasionally doesn't -
 #      picked on that basis, not because it's the newest available.
 GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-)
 # Same models-list endpoint used to pick GEMINI_MODEL above, reused here as
 # the cheap reachability check for /health (lists models instead of
 # generating anything).
 GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_TIMEOUT_SECONDS = 60.0
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+# Picked by querying Groq's live /openai/v1/models list for this key rather
+# than assuming a name (same lesson as the Gemini model situation above).
+# The full list returned: meta-llama/llama-prompt-guard-2-86m/-22m (input
+# classifiers, not instruction models), groq/compound and compound-mini
+# (Groq's own agentic/tool-calling wrapper - unpredictable for a plain
+# completions call, since it may invoke tools on its own), canopylabs/
+# orpheus-v1-english and orpheus-arabic-saudi (text-to-speech),
+# whisper-large-v3 and whisper-large-v3-turbo (speech-to-text),
+# qwen/qwen3.6-27b and qwen3.8-27b, allam-2-7b (Arabic-focused),
+# openai/gpt-oss-120b, openai/gpt-oss-20b, and openai/gpt-oss-safeguard-20b.
+# Of the plain instruction-following chat models, gpt-oss-20b is the
+# smallest/fastest (this failover tier only gets used after Ollama AND
+# Gemini have both already failed, so low latency matters) - a real test
+# call returned in ~39ms server-side (via the response's
+# usage.completion_time) and 3/3 test prompts succeeded.
+GROQ_MODEL = "openai/gpt-oss-20b"
+GROQ_TIMEOUT_SECONDS = 30.0
+# Same models-list endpoint used to pick GROQ_MODEL above, reused as the
+# /health reachability check, consistent with how Ollama/Gemini are checked.
+GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 
 # /health uses a short timeout of its own - it should fail fast, not wait
 # anywhere near as long as a real generation call would.
@@ -81,6 +112,25 @@ MAX_PROMPT_LENGTH = 2000
 # Loaded once at startup - loading the sentence-transformer per request would
 # dominate latency and defeat the point of caching.
 cache = SemanticCache()
+
+# One Backend instance per router-selectable local model, keyed by the exact
+# model name route() returns, so chat() can do ollama_backends[model_used]
+# without an if/elif per model. Both share OLLAMA_URL/OLLAMA_TIMEOUT_SECONDS
+# as constructor args (rather than backends.py hardcoding them) so tests can
+# monkeypatch a single instance's base_url to simulate a local failure
+# without touching real Ollama or the other model's backend.
+ollama_backends = {
+    "qwen2.5:1.5b": OllamaBackend(
+        model="qwen2.5:1.5b", base_url=OLLAMA_URL, timeout=OLLAMA_TIMEOUT_SECONDS
+    ),
+    "qwen2.5:3b": OllamaBackend(
+        model="qwen2.5:3b", base_url=OLLAMA_URL, timeout=OLLAMA_TIMEOUT_SECONDS
+    ),
+}
+gemini_backend = GeminiBackend(
+    model=GEMINI_MODEL, api_key=GEMINI_API_KEY, timeout=GEMINI_TIMEOUT_SECONDS
+)
+groq_backend = GroqBackend(model=GROQ_MODEL, api_key=GROQ_API_KEY, timeout=GROQ_TIMEOUT_SECONDS)
 
 
 @asynccontextmanager
@@ -108,56 +158,8 @@ class ChatResponse(BaseModel):
     cache_hit: bool
     latency_ms: float
     failed_over: bool = False
+    served_by: str = "ollama"  # "ollama" | "gemini" | "groq" | "cache"
     request_id: str
-
-
-async def call_ollama(model: str, prompt: str) -> dict:
-    """
-    Call Ollama's generate endpoint, non-streaming, and return the full
-    response payload - we need more than just the generated text: Ollama
-    also reports load_duration, eval_count, and eval_duration per request,
-    which we log to help tell apart "slow because CPU generation is slow"
-    from "slow because the model keeps getting reloaded".
-
-    keep_alive="30m" is passed explicitly on every request so the model
-    stays resident in Ollama between requests for the duration of a
-    benchmark run, regardless of Ollama's own default keep-alive setting
-    (Ollama runs as an already-started background service here, so an
-    OLLAMA_KEEP_ALIVE env var set in our own process's shell would not
-    reach it - the per-request keep_alive field is the mechanism that
-    actually takes effect).
-    """
-    payload = {"model": model, "prompt": prompt, "stream": False, "keep_alive": "30m"}
-    async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_SECONDS) as client:
-        resp = await client.post(OLLAMA_URL, json=payload)
-        resp.raise_for_status()
-        return resp.json()
-
-
-async def call_gemini(prompt: str) -> str:
-    """
-    Call Gemini's REST API directly (no SDK - one more dependency isn't
-    worth it when we already use httpx everywhere else). Used only as a
-    failover backend when the routed local Ollama call fails - see chat().
-
-    The API key is sent as the x-goog-api-key header, never as a URL query
-    parameter. This is deliberate: httpx exceptions (and any traceback that
-    ends up in a log) include the request URL in their message, so a
-    key-in-URL would leak the secret into any error output. A header never
-    appears in that message.
-    """
-    if not GEMINI_API_KEY:
-        raise RuntimeError(
-            "GEMINI_API_KEY is not set (add it to .env - see .env.example) - "
-            "cannot fail over to Gemini without it."
-        )
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=GEMINI_TIMEOUT_SECONDS) as client:
-        resp = await client.post(GEMINI_URL, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
 @app.get("/health")
@@ -191,10 +193,25 @@ async def health() -> dict:
         except Exception:
             gemini_status = "down"
 
+    if not GROQ_API_KEY:
+        groq_status = "unconfigured"
+    else:
+        groq_status = "down"
+        try:
+            async with httpx.AsyncClient(timeout=HEALTH_CHECK_TIMEOUT_SECONDS) as client:
+                resp = await client.get(
+                    GROQ_MODELS_URL, headers={"Authorization": f"Bearer {GROQ_API_KEY}"}
+                )
+                if resp.status_code == 200:
+                    groq_status = "up"
+        except Exception:
+            groq_status = "down"
+
     return {
         "gateway": "up",
         "ollama": ollama_status,
         "gemini": gemini_status,
+        "groq": groq_status,
         "cache_size": len(cache),
     }
 
@@ -220,47 +237,85 @@ async def chat(req: ChatRequest) -> ChatResponse:
     cached_entry, query_embedding = cache.find(req.prompt)
     if cached_entry is not None:
         latency_ms = (time.perf_counter() - start) * 1000
-        log_request(req.prompt, "cache", True, latency_ms, request_id=request_id)
+        # failed_over is set explicitly here, not left to the ChatResponse
+        # default: a cache hit is the healthy fast path, not a failover, and
+        # that shouldn't be an implicit fact someone could break by changing
+        # a default elsewhere later. failed_over is only ever True when
+        # served_by is "gemini" or "groq" specifically - see the assignment
+        # below the backend_chain loop for the miss path's equivalent.
+        log_request(
+            req.prompt,
+            "cache",
+            True,
+            latency_ms,
+            request_id=request_id,
+            served_by="cache",
+            failed_over=False,
+        )
         return ChatResponse(
             response=cached_entry.response,
             model_used="cache",
             cache_hit=True,
             latency_ms=latency_ms,
+            served_by="cache",
+            failed_over=False,
             request_id=request_id,
         )
 
-    model_used = route(req.prompt)
-    failed_over = False
+    routed_model = route(req.prompt)
+    # Three-tier failover chain, tried in order, stopping at the first
+    # success. This is still NOT a circuit breaker - no failure counter, no
+    # open/half-open state, no cooldown. Every request independently starts
+    # at Ollama; only that one request's own failures decide how far down
+    # the chain it falls. "Fails" means any exception out of generate() -
+    # a raised error (connection refused, HTTP 4xx/5xx) or a timeout past
+    # that backend's own configured timeout (OLLAMA_TIMEOUT_SECONDS is also
+    # the original failover trigger threshold from Phase 0).
+    backend_chain = [
+        ("ollama", ollama_backends[routed_model]),
+        ("gemini", gemini_backend),
+        ("groq", groq_backend),
+    ]
+
+    served_by = None
+    model_used = None
+    response_text = None
     load_duration_ms = None
     eval_count = None
     eval_duration_ms = None
+    failures = []
 
-    try:
-        ollama_data = await call_ollama(model_used, req.prompt)
-        response_text = ollama_data["response"]
-        # Ollama reports these in nanoseconds (eval_count is a plain token
-        # count, not a duration) - convert to ms so they're directly
-        # comparable to our own latency_ms.
-        load_duration_ms = ollama_data.get("load_duration", 0) / 1e6
-        eval_count = ollama_data.get("eval_count", 0)
-        eval_duration_ms = ollama_data.get("eval_duration", 0) / 1e6
-    except Exception as exc:
-        # Failure-triggered failover - deliberately NOT a full circuit
-        # breaker: no failure counter, no open/half-open/closed state, no
-        # cooldown before trying Ollama again on the next request. Every
-        # request independently tries Ollama first and only falls back to
-        # Gemini if THIS request's call fails. "Fails" means any exception
-        # out of call_ollama, which covers both a raised error (connection
-        # refused, HTTP 4xx/5xx from Ollama) and a timeout past
-        # OLLAMA_TIMEOUT_SECONDS (httpx raises ReadTimeout/ConnectTimeout,
-        # both plain exceptions here, once that threshold is hit).
-        print(
-            f"[{request_id}] Ollama call failed ({type(exc).__name__}: {exc}) "
-            "- failing over to Gemini"
+    for tier_name, backend in backend_chain:
+        try:
+            backend_response = await backend.generate(req.prompt)
+        except Exception as exc:
+            failures.append(f"{tier_name} ({type(exc).__name__})")
+            print(f"[{request_id}] {tier_name} backend failed: {type(exc).__name__}: {exc}")
+            continue
+
+        served_by = tier_name
+        model_used = backend_response.model_name
+        response_text = backend_response.text
+        load_duration_ms = backend_response.load_duration_ms
+        eval_count = backend_response.eval_count
+        eval_duration_ms = backend_response.eval_duration_ms
+        break
+
+    if served_by is None:
+        # All three backends failed for this request - a clear 502 instead
+        # of an unhandled exception turning into a generic 500. Nothing is
+        # cached or logged to gateway.db in this case, same as a validation
+        # failure above: there's no successful response to record.
+        raise HTTPException(
+            status_code=502,
+            detail=f"All backends failed for this request: {'; '.join(failures)}",
         )
-        response_text = await call_gemini(req.prompt)
-        model_used = GEMINI_MODEL
-        failed_over = True
+
+    # Explicit membership check, not `served_by != "ollama"`: failed_over
+    # means "an actual backend failover occurred", true only for gemini/groq.
+    # served_by can't be "cache" here (that path already returned above),
+    # but spelling it out this way doesn't rely on that being true forever.
+    failed_over = served_by in ("gemini", "groq")
 
     cache.add(req.prompt, query_embedding, response_text, model_used)
     # Persist immediately rather than only on clean shutdown (see lifespan()
@@ -282,6 +337,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
         eval_duration_ms=eval_duration_ms,
         failed_over=failed_over,
         request_id=request_id,
+        served_by=served_by,
     )
 
     return ChatResponse(
@@ -289,6 +345,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
         model_used=model_used,
         cache_hit=False,
         latency_ms=latency_ms,
+        served_by=served_by,
         failed_over=failed_over,
         request_id=request_id,
     )
