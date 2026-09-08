@@ -33,9 +33,22 @@ authentication, this is rate limiting only. Over the limit returns 429
 with a Retry-After header; nothing is logged to gateway.db for a
 rate-limited request, same as a 400 or the all-backends-failed 502 - there
 was no request the gateway actually attempted to answer.
+
+Trained router (optional, off by default): train_classifier.py fits a
+logistic regression on ~49 hand-judged examples from eval_set.csv and
+saves it to router_classifier.pkl. That is a small dataset for a 384-dim
+embedding input, and cross-validation showed it: the classifier collapsed
+to always predicting "1.5b" (see README.md's "Results & verification" for
+the actual numbers and the majority-class-baseline comparison that
+exposes this). It is NOT wired in as the default - `?router=trained` on
+POST /chat opts into it for exactly one request, so both routers stay
+live and comparable side by side rather than one confidently replacing
+the other on this little evidence. Falls back to the heuristic (with
+router_mode reflecting what actually ran) if the pickle file is missing.
 """
 
 import os
+import pickle
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -138,6 +151,32 @@ cache = SemanticCache()
 
 rate_limiter = RateLimiter(capacity=RATE_LIMIT_REQUESTS, window_seconds=RATE_LIMIT_WINDOW_SECONDS)
 
+# Optional trained router (see the module docstring's "Trained router"
+# section for why this isn't the default). Labels the classifier was
+# trained on are "1.5b"/"3b" strings (see train_classifier.py), not the
+# full Ollama model names - map back here.
+ROUTER_CLASSIFIER_PATH = "router_classifier.pkl"
+TRAINED_LABEL_TO_MODEL = {"1.5b": "qwen2.5:1.5b", "3b": "qwen2.5:3b"}
+try:
+    with open(ROUTER_CLASSIFIER_PATH, "rb") as f:
+        router_classifier = pickle.load(f)
+except FileNotFoundError:
+    router_classifier = None
+
+
+def route_prompt(prompt: str, router_mode: str) -> tuple[str, str]:
+    """
+    Returns (model_name, actual_router_mode_used). actual_router_mode_used
+    can differ from the requested router_mode: "trained" silently falls
+    back to "heuristic" if router_classifier.pkl hasn't been trained yet,
+    rather than erroring a request over a missing optional file.
+    """
+    if router_mode == "trained" and router_classifier is not None:
+        embedding = cache.embed(prompt)
+        label = router_classifier.predict(embedding.reshape(1, -1))[0]
+        return TRAINED_LABEL_TO_MODEL[label], "trained"
+    return route(prompt), "heuristic"
+
 # One Backend instance per router-selectable local model, keyed by the exact
 # model name route() returns, so chat() can do ollama_backends[model_used]
 # without an if/elif per model. Both share OLLAMA_URL/OLLAMA_TIMEOUT_SECONDS
@@ -184,6 +223,7 @@ class ChatResponse(BaseModel):
     latency_ms: float
     failed_over: bool = False
     served_by: str = "ollama"  # "ollama" | "gemini" | "groq" | "cache"
+    router_mode: str = "heuristic"  # "heuristic" | "trained" - see route_prompt() above
     request_id: str
 
 
@@ -245,6 +285,7 @@ async def health() -> dict:
 async def chat(
     req: ChatRequest,
     x_api_key: Annotated[str | None, Header(alias=RATE_LIMIT_HEADER)] = None,
+    router: str = "heuristic",  # query param: ?router=trained opts into the experimental classifier
 ) -> ChatResponse:
     # Rate limit check first, before anything else runs - cheapest possible
     # rejection for a client over its limit. Not logged to gateway.db, same
@@ -311,10 +352,11 @@ async def chat(
             latency_ms=latency_ms,
             served_by="cache",
             failed_over=False,
+            router_mode="heuristic",  # a cache hit never routes at all - moot, but explicit
             request_id=request_id,
         )
 
-    routed_model = route(req.prompt)
+    routed_model, router_mode_used = route_prompt(req.prompt, router)
     # Three-tier failover chain, tried in order, stopping at the first
     # success. This is still NOT a circuit breaker - no failure counter, no
     # open/half-open state, no cooldown. Every request independently starts
@@ -399,5 +441,6 @@ async def chat(
         latency_ms=latency_ms,
         served_by=served_by,
         failed_over=failed_over,
+        router_mode=router_mode_used,
         request_id=request_id,
     )

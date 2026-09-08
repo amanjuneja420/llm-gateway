@@ -99,6 +99,12 @@ venv\Scripts\python generate_eval_set.py
 ```
 Runs 50 prompts through both models directly (bypassing the router) and writes `eval_set.csv` for manual quality judging — see "Results & verification".
 
+**10. (Optional) Train and evaluate the routing classifier**, once `eval_set.csv`'s `which_is_better` column is filled in by hand:
+```bash
+venv\Scripts\python train_classifier.py
+```
+Prints cross-validated accuracy and a heuristic-vs-classifier comparison, and saves `router_classifier.pkl`. Once that file exists, `POST /chat?router=trained` opts a request into the trained router instead of the default heuristic — see "Trained routing classifier" under "Results & verification" for why the heuristic stays the default.
+
 ## Project structure
 
 - [`main.py`](main.py) — the FastAPI app: `POST /chat`, `GET /health`, request validation, request-ID tracing, and the failover chain, all wired together
@@ -114,6 +120,7 @@ Runs 50 prompts through both models directly (bypassing the router) and writes `
 - [`aggregate_benchmark_runs.py`](aggregate_benchmark_runs.py) — combines several `benchmark.py` runs' printed summaries into one table with min/max/avg speedup and hit rate
 - [`cost_estimate.py`](cost_estimate.py) — estimates what this project's real token volume would have cost on paid hosted APIs, versus $0 for local Ollama calls
 - [`generate_eval_set.py`](generate_eval_set.py) — router evaluation harness: runs 50 prompts through both local models directly and writes [`eval_set.csv`](eval_set.csv) for manual quality judging (generation only — it does not judge)
+- [`train_classifier.py`](train_classifier.py) — trains and cross-validates a routing classifier on the hand-judged `eval_set.csv`, compares it against `router.py`'s heuristic, and saves [`router_classifier.pkl`](router_classifier.pkl)
 - `runs/` — raw `gateway.db` snapshot from each `benchmark.py` run (`gateway_run_<UTC timestamp>.db`), archived automatically before the next run wipes the live `gateway.db`
 - `gateway.db` — the committed SQLite log; currently a reference snapshot from one full benchmark run (Run 3, see below), kept so the results below are re-derivable rather than just asserted
 - `.env` (not committed — see `.env.example`) — holds `GEMINI_API_KEY` and `GROQ_API_KEY`, loaded at startup via `python-dotenv`
@@ -130,7 +137,7 @@ Runs 50 prompts through both models directly (bypassing the router) and writes `
 
 If either signal fires, the prompt goes to `qwen2.5:3b`; otherwise `qwen2.5:1.5b`.
 
-**Why a heuristic instead of a trained classifier:** given the time I had, a heuristic is instant to run (no inference cost of its own), fully transparent (every routing decision can be explained by pointing at the exact line of code that made it), and needs zero training data or evaluation harness to trust. A trained router could route more accurately in principle, but that requires labeled examples of which model *should* have handled a given prompt, plus its own accuracy evaluation. I've since built the generation half of that evaluation harness (see Phase 4 under "Results & verification") — the labeled data doesn't exist yet, but the path to getting it does.
+**Why a heuristic instead of a trained classifier:** given the time I had, a heuristic is instant to run (no inference cost of its own), fully transparent (every routing decision can be explained by pointing at the exact line of code that made it), and needs zero training data or evaluation harness to trust. A trained router could route more accurately in principle, but that requires labeled examples of which model *should* have handled a given prompt, plus its own accuracy evaluation. I've since built and run that full path — see "Trained routing classifier (experimental)" under "Results & verification" for the real numbers — and the honest result is that ~49 labeled examples wasn't enough for it to actually beat this heuristic. The heuristic stays the default; the trained classifier is available as an explicit opt-in, not a replacement.
 
 ### The semantic cache, its similarity threshold, and persistence
 
@@ -278,18 +285,52 @@ The test swaps in a smaller/faster limiter (3 requests / 3 seconds instead of pr
 
 **A real interaction worth knowing about:** [`benchmark.py`](benchmark.py) sends no `X-API-Key` header, so all 30 of its requests share the single `"anonymous"` bucket. At the default 10/60s, a fresh benchmark run can burn through the initial 10-request burst well within a minute and start hitting `429`s partway through. `benchmark.py`'s own per-request error handling (see the benchmark-crash incident note earlier in this section) will catch these as `FAIL` lines and keep going rather than crash, but the resulting hit-rate/latency numbers from a fresh run would no longer match the 5-run table above without either raising the limit, giving the benchmark its own header, or exempting it. Not fixed here since it wasn't asked for — flagged so a future re-run's numbers aren't a surprise.
 
+### Trained routing classifier (experimental, opt-in only)
+
+[`generate_eval_set.py`](generate_eval_set.py) produced 50 prompts with both models' real responses; I then judged each one by hand, in `eval_set.csv`'s `which_is_better` column, as `"1.5b"`, `"3b"`, `"tie"`, or `"neither"` (neither response was good). [`train_classifier.py`](train_classifier.py) turns that judgment into a routing classifier:
+
+**Methodology:** 1 `"neither"` row was dropped — it carries no signal about which *model* should have handled the prompt, only that both answers were bad. The 20 `"tie"` rows were folded into the `"1.5b"` label rather than dropped or left as a third class — when both models answer equally well, routing's whole point is picking the *minimum sufficient* model, not winning a quality contest, so a tie should route to the cheaper one. That leaves 49 rows: 32 labeled `"1.5b"`, 17 labeled `"3b"`. Each prompt is embedded with the exact same pipeline `cache.py` already uses (`SemanticCache.embed()` — `all-MiniLM-L6-v2`, `normalize_embeddings=True`), so the classifier and the cache are guaranteed to see prompts the same way.
+
+**Real cross-validation output**, 5-fold stratified (49 examples is small enough that a single train/test split would be noise, not a number):
+```
+  Fold 1/5: accuracy=0.700  (n_test=10)
+  Fold 2/5: accuracy=0.700  (n_test=10)
+  Fold 3/5: accuracy=0.600  (n_test=10)
+  Fold 4/5: accuracy=0.600  (n_test=10)
+  Fold 5/5: accuracy=0.667  (n_test=9)
+
+  Mean CV accuracy: 0.653  (std: 0.045)
+
+  Confusion matrix (rows=actual, cols=predicted), aggregated across folds:
+               pred 1.5b   pred 3b
+  actual 1.5b          32         0
+   actual 3b          17         0
+```
+
+**The honest finding, not the flattering one:** the confusion matrix shows the classifier predicted `"1.5b"` for every single one of the 49 rows across all folds — zero `"3b"` predictions, ever. The majority-class baseline (always guess `"1.5b"`, learn nothing) is `32/49 = 0.653` — identical to the reported mean CV accuracy to three decimal places. `LogisticRegression`'s default L2 regularization was deliberately left on (49 examples with 384-dim embeddings is a real small-n-large-p regime; disabling it would overfit, not help), and the model still collapsed to the majority class rather than finding a usable signal in the embeddings.
+
+**The comparison that actually matters — done side by side, reported whichever way it goes:**
+```
+  Heuristic router accuracy:              0.592
+  Trained classifier accuracy (CV):       0.653  (std: 0.045)
+  Majority-class baseline ('always 1.5b'): 0.653
+```
+The classifier's number is numerically higher than the heuristic's, but that comparison is misleading on its own: the classifier isn't beating the heuristic by routing anything correctly that the heuristic gets wrong — it's just that guessing the majority label happens to score higher than the heuristic does on this particular 65/35-imbalanced sample of 49 prompts. The honest conclusion is that 49 examples was not enough data for logistic regression on sentence embeddings to learn a real routing signal here, not that the classifier is the better router.
+
+**What's shipped as a result, matching that honest conclusion:** the heuristic stays the default. `router_classifier.pkl` (trained on all 49 rows, not held out) is loaded at startup if present, and `POST /chat?router=trained` opts a single request into it — `main.py`'s `route_prompt()` falls back to the heuristic if the pickle file is missing, and the response's `router_mode` field always says which one actually ran. Both are live and comparable side by side; nothing was swapped by default on ~49 labeled examples. Verified end to end against the running server: the same complex prompt routes to `qwen2.5:3b` under the default heuristic and to `qwen2.5:1.5b` under `?router=trained` — consistent with the classifier's majority-class collapse.
+
 ## Known limitations
 
 - **A request where all three backends fail is not logged anywhere.** The `502` path in `chat()` returns before calling `log_request()` — confirmed both by code inspection and by a live test with all three backends pointed at unreachable addresses (no `gateway.db` row was written). Every other outcome (cache hit, any successful tier, even a 400 from validation happening before this point) either logs or was never a "the system tried and failed" event in the first place; this one specific path is the exception, stated here rather than implied away.
 - **The semantic cache has no size cap or eviction policy.** Persistence (see "Design decisions") means it also no longer resets on restart, which is progress, but the trade-off is that it now grows unbounded for as long as it keeps getting new entries — nothing prunes old or rarely-hit entries.
 - **Runs A, B, 1, and 2 (of the original 5-run benchmark set) have no preserved raw database.** The archiving mechanism (`runs/gateway_run_<timestamp>.db`) didn't exist yet when those were executed, so their numbers are transcribed from that session's printed summaries/logs, not re-derivable from a raw `gateway.db`. Every benchmark run from Run 3 onward is fully re-derivable from raw per-request rows instead.
 - **Everything was measured on one CPU-only machine** (Intel integrated graphics, no CUDA). The routing split and cache speedup direction should generalize; the absolute millisecond numbers are specific to this hardware and clearly move around with background load even on this one machine (see the benchmark's 400x–780x spread).
-- **The router is still a heuristic, not a trained model.** The generation half of an evaluation harness now exists (`eval_set.csv`, 50 prompts x both models) but the labeled judging data doesn't yet — see "What I'd build next".
+- **The router is still a heuristic by default, and the trained alternative doesn't clearly beat it yet.** The full harness now exists end to end — generation, manual judging, cross-validated training, and an opt-in `?router=trained` mode — but at 49 labeled examples the classifier collapsed to a majority-class predictor rather than learning a real signal (see "Trained routing classifier" above). More labeled data is the actual next step, not a different model or algorithm.
 - **The failover chain is a simple ordered retry, not a circuit breaker** — no failure counter, no cooldown, no half-open state. It only ever reacts to the one request in front of it, at every tier.
 - **No Docker, Kubernetes, or deployment/CI-CD setup**, and no load balancing across multiple local model replicas. These were left out deliberately rather than forgotten — this was a time-boxed solo project, and I don't have hands-on deployment experience I could back up in an interview yet if asked to defend those choices.
 
 ## What I'd build next
 
 - SSE streaming for the `/chat` response
-- Manually judge `eval_set.csv` (which model answered better per prompt — "1.5b", "3b", or "tie"), then train a routing classifier on the result. The generation half is done; the judging and the classifier itself are still pending.
+- More labeled routing examples — the real bottleneck for the trained classifier, not a different model or algorithm. A few hundred judged prompts, not 49, is the next thing to try before concluding a learned router can't help here.
 - A small dashboard over `gateway.db` instead of querying it by hand
