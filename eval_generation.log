@@ -1,0 +1,56 @@
+Generating eval set: 50 prompts x 2 models = 100 real generations
+This can take a while on CPU-only hardware, especially for qwen2.5:3b.
+
+[ 1/50]   13.3s  What is the capital of Japan?
+[ 2/50]   75.6s  Explain how photosynthesis works in plants.
+[ 3/50]    3.5s  What is 15 times 7?
+[ 4/50]   18.8s  Name three primary colors.
+[ 5/50]   97.4s  Compare the advantages and disadvantages of remote work versus office 
+[ 6/50]    4.8s  What is the largest planet in our solar system?
+[ 7/50]   37.5s  Why do seasons change throughout the year?
+[ 8/50]    4.0s  What year did World War II end?
+[ 9/50]    3.0s  What is the chemical symbol for gold?
+[10/50]  105.0s  What are the steps to bake a basic loaf of bread from scratch?
+[11/50]    4.5s  List the days of the week.
+[12/50]    3.3s  Translate 'hello' to Spanish.
+[13/50]   63.2s  Analyze the causes of the fall of the Roman Empire.
+[14/50]   17.4s  Summarize the plot of Romeo and Juliet in a few sentences.
+[15/50]   60.4s  What is the difference between machine learning and deep learning?
+[16/50]   84.4s  Evaluate the pros and cons of electric vehicles compared to gasoline c
+[17/50]    8.8s  What is the tallest mountain in the world?
+[18/50]   90.6s  I've been thinking about switching careers into software engineering, 
+[19/50]    6.0s  What is the boiling point of water in Celsius?
+[20/50]   82.4s  Contrast the benefits of solar power and wind power for home energy us
+[21/50]    4.7s  What is the square root of 144?
+[22/50]    4.3s  Name the closest star to Earth.
+[23/50]    3.4s  What is the freezing point of water in Fahrenheit?
+[24/50]    6.5s  How many continents are there?
+[25/50]    5.7s  What is the currency used in Japan?
+[26/50]    3.4s  Spell the word 'necessary' correctly.
+[27/50]    3.2s  What is the chemical formula for water?
+[28/50]    4.3s  Name two prime numbers between 10 and 20.
+[29/50]    3.0s  What language is primarily spoken in Brazil?
+[30/50]    5.4s  How many days are there in a leap year?
+[31/50]    2.8s  What is the capital of Australia?
+[32/50]   19.7s  Convert 100 Fahrenheit to Celsius.
+[33/50]   11.2s  Name a mammal that lays eggs.
+[34/50]    6.0s  What is the plural of 'cactus'?
+[35/50]    3.0s  How many sides does a hexagon have?
+[36/50]   56.5s  Explain why the sky appears blue during the day and red or orange at s
+[37/50]   87.7s  Compare the economic systems of capitalism and socialism.
+[38/50]   73.4s  What are the steps involved in photosynthesis at the cellular level?
+[39/50]   68.6s  Why do some programming languages use garbage collection while others 
+[40/50]   96.0s  Summarize the causes and consequences of the Industrial Revolution.
+[41/50]   83.0s  Explain the difference between a stack and a queue data structure, wit
+[42/50]   75.9s  Analyze why the Roman aqueduct system was considered an engineering ma
+[43/50]   91.5s  Compare and contrast supervised and unsupervised machine learning appr
+[44/50]   70.2s  Explain how vaccines work to build immunity against diseases.
+[45/50]   88.8s  Why is it important to normalize a database, and what problems can ari
+[46/50]  103.3s  Describe the steps to set up a basic REST API using Python and FastAPI
+[47/50]   92.3s  Evaluate the tradeoffs between renewable energy sources like solar and
+[48/50]   72.9s  Explain the difference between TCP and UDP and when you would use each
+[49/50]   70.5s  Why do interest rates affect inflation, and how do central banks use t
+[50/50]   79.8s  Compare the plots and themes of the novels "1984" and "Brave New World
+
+Wrote 50 rows to eval_set.csv in 2081.0s total.
+which_is_better is intentionally empty - fill it in by hand with '1.5b', '3b', or 'tie'. This script only generates; it does not judge.
