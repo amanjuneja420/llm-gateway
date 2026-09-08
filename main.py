@@ -20,8 +20,11 @@ was unchanged by it. Groq was then added as a third backend and the
 failover chain extended to try all three in order, stopping at the first
 success (see the loop in chat() below) and returning 502 only if all three
 fail. served_by ("ollama"/"gemini"/"groq"/"cache") records which one
-actually answered; failed_over is just served_by != "ollama", kept for
-backward compatibility with Phase 1's simpler two-tier framing.
+actually answered; failed_over is explicitly `served_by in ("gemini",
+"groq")`, kept for backward compatibility with Phase 1's simpler two-tier
+framing - it's True only when an actual backend failover occurred, and
+False for both "ollama" and "cache" (a cache hit is the healthy fast path,
+not a failover, and is set explicitly rather than relying on a default).
 """
 
 import os
