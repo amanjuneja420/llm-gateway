@@ -25,19 +25,29 @@ actually answered; failed_over is explicitly `served_by in ("gemini",
 framing - it's True only when an actual backend failover occurred, and
 False for both "ollama" and "cache" (a cache hit is the healthy fast path,
 not a failover, and is set explicitly rather than relying on a default).
+
+Rate limiting: a per-client-key token bucket (rate_limiter.py), checked at
+the very start of chat() before anything else runs. The client key is
+whatever the X-API-Key header holds - not validated against any real
+authentication, this is rate limiting only. Over the limit returns 429
+with a Retry-After header; nothing is logged to gateway.db for a
+rate-limited request, same as a 400 or the all-backends-failed 502 - there
+was no request the gateway actually attempted to answer.
 """
 
 import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from backends import GeminiBackend, GroqBackend, OllamaBackend
+from rate_limiter import RateLimiter
 from cache import SemanticCache
 from db import init_db, log_request
 from router import route
@@ -112,9 +122,21 @@ HEALTH_CHECK_TIMEOUT_SECONDS = 5.0
 # oversized/malformed input.
 MAX_PROMPT_LENGTH = 2000
 
+# Rate limiting: token bucket, per client key, keyed by this header. Not a
+# real auth mechanism - a client can send any value here, or none at all
+# (bucketed under "anonymous"). 10/minute is a reasonable default for a
+# single-instance MVP with no real auth in front of it; both numbers are
+# named constants so they're trivial to retune.
+RATE_LIMIT_HEADER = "X-API-Key"
+RATE_LIMIT_REQUESTS = 10
+RATE_LIMIT_WINDOW_SECONDS = 60.0
+ANONYMOUS_CLIENT_KEY = "anonymous"
+
 # Loaded once at startup - loading the sentence-transformer per request would
 # dominate latency and defeat the point of caching.
 cache = SemanticCache()
+
+rate_limiter = RateLimiter(capacity=RATE_LIMIT_REQUESTS, window_seconds=RATE_LIMIT_WINDOW_SECONDS)
 
 # One Backend instance per router-selectable local model, keyed by the exact
 # model name route() returns, so chat() can do ollama_backends[model_used]
@@ -220,7 +242,34 @@ async def health() -> dict:
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest) -> ChatResponse:
+async def chat(
+    req: ChatRequest,
+    x_api_key: Annotated[str | None, Header(alias=RATE_LIMIT_HEADER)] = None,
+) -> ChatResponse:
+    # Rate limit check first, before anything else runs - cheapest possible
+    # rejection for a client over its limit. Not logged to gateway.db, same
+    # as a validation failure or the all-backends-failed 502 below: there
+    # was no request the gateway actually attempted to answer.
+    client_key = x_api_key or ANONYMOUS_CLIENT_KEY
+    allowed, retry_after = rate_limiter.check(client_key)
+    if not allowed:
+        retry_after_seconds = max(1, round(retry_after))
+        # Read capacity/window_seconds off the live rate_limiter object,
+        # not the RATE_LIMIT_REQUESTS/RATE_LIMIT_WINDOW_SECONDS constants
+        # directly - main.rate_limiter can be swapped out (see
+        # test_rate_limit.py), and this message should describe whatever
+        # limiter is actually enforcing the check above, not always the
+        # production defaults.
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Rate limit exceeded: {rate_limiter.capacity:.0f} requests per "
+                f"{rate_limiter.window_seconds:.0f}s per {RATE_LIMIT_HEADER}. "
+                f"Retry after {retry_after_seconds}s."
+            ),
+            headers={"Retry-After": str(retry_after_seconds)},
+        )
+
     # Generated once per request and carried through every observable
     # artifact of handling it - the DB log row and the response itself, plus
     # any print() emitted along the way (see the failover branch below) - so

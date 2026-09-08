@@ -4,7 +4,7 @@ A local LLM gateway that routes prompts between two Ollama models by a heuristic
 
 ## What this is
 
-This is a single FastAPI endpoint (`POST /chat`) sitting in front of two Ollama models running on my own machine: a small one (`qwen2.5:1.5b`) for simple prompts and a bigger one (`qwen2.5:3b`) for longer or more complex ones. Before calling either, it checks a semantic cache so a near-duplicate of a prompt it's already answered doesn't trigger another model call. If the routed local call fails or times out, it retries through a chain of cloud fallbacks — Gemini, then Groq — instead of just erroring out. Every request — hit, miss, or failover — gets logged to SQLite with a per-request ID, so the numbers in this README come from querying that log, not from memory. There's also a `GET /health` endpoint, basic input validation, and a cache that survives a restart.
+This is a single FastAPI endpoint (`POST /chat`) sitting in front of two Ollama models running on my own machine: a small one (`qwen2.5:1.5b`) for simple prompts and a bigger one (`qwen2.5:3b`) for longer or more complex ones. Before calling either, it checks a semantic cache so a near-duplicate of a prompt it's already answered doesn't trigger another model call. If the routed local call fails or times out, it retries through a chain of cloud fallbacks — Gemini, then Groq — instead of just erroring out. Every request — hit, miss, or failover — gets logged to SQLite with a per-request ID, so the numbers in this README come from querying that log, not from memory. There's also a `GET /health` endpoint, basic input validation, per-client rate limiting, and a cache that survives a restart.
 
 ## Why I built this
 
@@ -80,14 +80,20 @@ venv\Scripts\python test_failover.py
 ```
 Covers a normal Ollama request, a cache hit, Ollama-fails-to-Gemini, and Ollama+Gemini-fail-to-Groq — see "Results & verification" for real output.
 
-**7. (Optional) Deeper analysis, once `gateway.db` has some data in it:**
+**7. (Optional) Verify rate limiting:**
+```bash
+venv\Scripts\python test_rate_limit.py
+```
+Finishes in a few seconds — it swaps in a fast test-only limiter rather than waiting out the production 60-second window.
+
+**8. (Optional) Deeper analysis, once `gateway.db` has some data in it:**
 ```bash
 venv\Scripts\python analyze_ollama_stats.py       # load-time vs. generation-time breakdown per model
 venv\Scripts\python aggregate_benchmark_runs.py   # combine multiple benchmark runs into one table
 venv\Scripts\python cost_estimate.py              # what this token volume would cost on paid APIs
 ```
 
-**8. (Optional, slow — ~35 minutes on CPU) generate the router evaluation set:**
+**9. (Optional, slow — ~35 minutes on CPU) generate the router evaluation set:**
 ```bash
 venv\Scripts\python generate_eval_set.py
 ```
@@ -97,11 +103,13 @@ Runs 50 prompts through both models directly (bypassing the router) and writes `
 
 - [`main.py`](main.py) — the FastAPI app: `POST /chat`, `GET /health`, request validation, request-ID tracing, and the failover chain, all wired together
 - [`backends.py`](backends.py) — the `Backend` interface (`generate(prompt) -> BackendResponse`) and its three implementations: `OllamaBackend`, `GeminiBackend`, `GroqBackend`
+- [`rate_limiter.py`](rate_limiter.py) — the token-bucket rate limiter, one bucket per client key
 - [`router.py`](router.py) — the heuristic model router (no I/O, pure function)
 - [`cache.py`](cache.py) — the semantic cache (embedding + cosine similarity + disk persistence)
 - [`db.py`](db.py) — SQLite schema + logging helper
 - [`benchmark.py`](benchmark.py) — standalone load/test script, run manually against the live server
 - [`test_failover.py`](test_failover.py) — standalone test script for the full three-tier failover chain
+- [`test_rate_limit.py`](test_rate_limit.py) — standalone test script for the rate limiter (unit-level + endpoint wiring)
 - [`analyze_ollama_stats.py`](analyze_ollama_stats.py) — breaks down Ollama's own load/eval timing per model from `gateway.db`
 - [`aggregate_benchmark_runs.py`](aggregate_benchmark_runs.py) — combines several `benchmark.py` runs' printed summaries into one table with min/max/avg speedup and hit rate
 - [`cost_estimate.py`](cost_estimate.py) — estimates what this project's real token volume would have cost on paid hosted APIs, versus $0 for local Ollama calls
@@ -236,6 +244,40 @@ If ALL of this volume had instead gone to a paid API:
 
 Real evidence from an actual run, in [`eval_generation.log`](eval_generation.log): all 50 prompts × 2 models = 100 real generations succeeded (zero errors), taking **34.7 minutes (2081s) total** on this CPU-only machine — individual `qwen2.5:3b` calls ran up to 103 seconds. Confirmed before committing: `which_is_better` is empty on all 50 rows. This script only generates; **judging which model answered better, by hand, is separate work not done by this script or by me** — see "What I'd build next".
 
+### Rate limiting
+
+[`rate_limiter.py`](rate_limiter.py) is a token bucket per client key, checked at the very start of `chat()` before anything else runs (cache lookup, routing, validation, all of it). The client key comes from an `X-API-Key` header — not validated against any real authentication, this is rate limiting only, not auth — with no header at all bucketed under `"anonymous"`. Default: `RATE_LIMIT_REQUESTS = 10` requests per `RATE_LIMIT_WINDOW_SECONDS = 60` seconds, both named constants in `main.py`. A bucket starts full (an immediate burst up to 10 is allowed) and refills continuously rather than resetting on a fixed clock boundary. Over the limit returns `429` with a `Retry-After` header; nothing is logged to `gateway.db` for a rate-limited request, the same as a `400` or the all-backends-failed `502`.
+
+[`test_rate_limit.py`](test_rate_limit.py) is split into two parts on purpose: real Ollama latency (1–4+ seconds per call, sometimes much more - see the benchmark results above) is too slow and variable to reliably test *burst* behavior by firing several real requests back to back and assuming near-zero elapsed time between them, so the token-bucket algorithm itself is tested in isolation first (no model calls, fully deterministic), then the endpoint wiring is confirmed separately with only 2 real calls. Real output from an actual run:
+
+```
+=== Part 1: RateLimiter/TokenBucket in isolation (no model calls) ===
+  [1/3] PASS - allowed (within capacity)
+  [2/3] PASS - allowed (within capacity)
+  [3/3] PASS - allowed (within capacity)
+  PASS - rejected over capacity, retry_after=1.00s
+  Waiting 3.5s for the window to reset...
+  PASS - allowed again after the window reset
+
+=== Part 2: confirm main.chat() actually enforces this (2 real model calls) ===
+Firing 1 real request against an already-drained bucket (should be rejected)...
+  PASS - got 429, Retry-After='1', detail='Rate limit exceeded: 3 requests per 3s per X-API-Key. Retry after 1s.'
+Waiting 3.5s for the window to reset...
+Firing 1 more real request (after reset - should succeed)...
+  PASS - succeeded again (model_used=qwen2.5:1.5b)
+
+============================================================
+RATE LIMIT TEST SUMMARY
+============================================================
+  PASS   token bucket (unit, isolated)
+  PASS   chat() endpoint enforcement (real requests)
+============================================================
+```
+
+The test swaps in a smaller/faster limiter (3 requests / 3 seconds instead of production's 10/60) so it finishes in seconds — the 429 message above correctly reports `3 requests per 3s` because it reads `capacity`/`window_seconds` off whichever `RateLimiter` instance is actually live, not off the module-level defaults, a real bug the first version of this test caught (the message used to always say "10 requests per 60s" regardless of which limiter was actually enforcing the check).
+
+**A real interaction worth knowing about:** [`benchmark.py`](benchmark.py) sends no `X-API-Key` header, so all 30 of its requests share the single `"anonymous"` bucket. At the default 10/60s, a fresh benchmark run can burn through the initial 10-request burst well within a minute and start hitting `429`s partway through. `benchmark.py`'s own per-request error handling (see the benchmark-crash incident note earlier in this section) will catch these as `FAIL` lines and keep going rather than crash, but the resulting hit-rate/latency numbers from a fresh run would no longer match the 5-run table above without either raising the limit, giving the benchmark its own header, or exempting it. Not fixed here since it wasn't asked for — flagged so a future re-run's numbers aren't a surprise.
+
 ## Known limitations
 
 - **A request where all three backends fail is not logged anywhere.** The `502` path in `chat()` returns before calling `log_request()` — confirmed both by code inspection and by a live test with all three backends pointed at unreachable addresses (no `gateway.db` row was written). Every other outcome (cache hit, any successful tier, even a 400 from validation happening before this point) either logs or was never a "the system tried and failed" event in the first place; this one specific path is the exception, stated here rather than implied away.
@@ -243,13 +285,11 @@ Real evidence from an actual run, in [`eval_generation.log`](eval_generation.log
 - **Runs A, B, 1, and 2 (of the original 5-run benchmark set) have no preserved raw database.** The archiving mechanism (`runs/gateway_run_<timestamp>.db`) didn't exist yet when those were executed, so their numbers are transcribed from that session's printed summaries/logs, not re-derivable from a raw `gateway.db`. Every benchmark run from Run 3 onward is fully re-derivable from raw per-request rows instead.
 - **Everything was measured on one CPU-only machine** (Intel integrated graphics, no CUDA). The routing split and cache speedup direction should generalize; the absolute millisecond numbers are specific to this hardware and clearly move around with background load even on this one machine (see the benchmark's 400x–780x spread).
 - **The router is still a heuristic, not a trained model.** The generation half of an evaluation harness now exists (`eval_set.csv`, 50 prompts x both models) but the labeled judging data doesn't yet — see "What I'd build next".
-- **No rate limiting.** Nothing stops one client from firing requests as fast as the CPU (or Gemini's/Groq's own rate limits) will allow.
 - **The failover chain is a simple ordered retry, not a circuit breaker** — no failure counter, no cooldown, no half-open state. It only ever reacts to the one request in front of it, at every tier.
 - **No Docker, Kubernetes, or deployment/CI-CD setup**, and no load balancing across multiple local model replicas. These were left out deliberately rather than forgotten — this was a time-boxed solo project, and I don't have hands-on deployment experience I could back up in an interview yet if asked to defend those choices.
 
 ## What I'd build next
 
-- Rate limiting
 - SSE streaming for the `/chat` response
 - Manually judge `eval_set.csv` (which model answered better per prompt — "1.5b", "3b", or "tie"), then train a routing classifier on the result. The generation half is done; the judging and the classifier itself are still pending.
 - A small dashboard over `gateway.db` instead of querying it by hand
