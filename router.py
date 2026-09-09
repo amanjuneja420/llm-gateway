@@ -22,6 +22,8 @@ Tune the two constants below to change routing behavior; nothing else in this
 file needs to change to retune it.
 """
 
+import re
+
 # Prompts with strictly more words than this are considered "long" and get
 # routed to the bigger model. 20 words is roughly the length where a prompt
 # stops being a single simple question and starts being a paragraph-style
@@ -52,9 +54,23 @@ COMPLEXITY_KEYWORDS = {
 SIMPLE_MODEL = "qwen2.5:1.5b"
 COMPLEX_MODEL = "qwen2.5:3b"
 
+# Compiled once at import, not per call: a single word-boundary-delimited
+# alternation of every keyword/phrase above. This is a genuine whole-word
+# match, matching the comment's claim above it (which the previous plain
+# `keyword in prompt_lower` substring check did not - "footsteps" contains
+# "steps" as a substring and would incorrectly trip this, despite having
+# nothing to do with instructions or reasoning). \b bounds the OUTER edges
+# of a multi-word phrase like "how does" too (Python's \b is defined on
+# \w = [A-Za-z0-9_] boundaries, not literal spaces), so a phrase still
+# matches as a whole unit; re.escape() on each keyword makes the literal
+# hyphens in "step-by-step" safe to include in the pattern.
+_COMPLEXITY_PATTERN = re.compile(
+    r"\b(?:" + "|".join(re.escape(keyword) for keyword in COMPLEXITY_KEYWORDS) + r")\b"
+)
+
 
 def _has_complexity_keyword(prompt_lower: str) -> bool:
-    return any(keyword in prompt_lower for keyword in COMPLEXITY_KEYWORDS)
+    return _COMPLEXITY_PATTERN.search(prompt_lower) is not None
 
 
 def route(prompt: str) -> str:
@@ -88,6 +104,11 @@ if __name__ == "__main__":
             "tradeoffs between using SQLite and Postgres for a low-traffic "
             "internal tool, can you walk me through it"
         ),
+        # Whole-word matching regression cases - a plain substring check
+        # would incorrectly route both of these to the complex model, since
+        # "steps" and "why" appear as substrings of longer words here.
+        "I heard footsteps outside my window last night.",  # "steps" is a substring only - should stay SIMPLE
+        "What are the steps to bake bread?",  # genuine "steps" usage - should still route COMPLEX
     ]
     for s in samples:
         print(f"[{route(s):>13}]  ({len(s.split()):>2} words)  {s}")
