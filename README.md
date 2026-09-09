@@ -86,6 +86,12 @@ venv\Scripts\python test_rate_limit.py
 ```
 Finishes in a few seconds — it swaps in a fast test-only limiter rather than waiting out the production 60-second window.
 
+**7b. (Optional, slow — a few minutes on CPU) run the concurrent load test:**
+```bash
+venv\Scripts\python load_test.py
+```
+Fires genuinely concurrent requests (not sequential, unlike `benchmark.py`) to surface race conditions in the cache and rate limiter, plus real throughput/latency under concurrency — see "Real concurrent load test" under "Results & verification". Archives and restores `gateway.db` automatically, same pattern as `benchmark.py`.
+
 **8. (Optional) Deeper analysis, once `gateway.db` has some data in it:**
 ```bash
 venv\Scripts\python analyze_ollama_stats.py       # load-time vs. generation-time breakdown per model
@@ -113,7 +119,8 @@ Prints cross-validated accuracy and a heuristic-vs-classifier comparison, and sa
 - [`router.py`](router.py) — the heuristic model router (no I/O, pure function)
 - [`cache.py`](cache.py) — the semantic cache (embedding + cosine similarity + disk persistence)
 - [`db.py`](db.py) — SQLite schema + logging helper
-- [`benchmark.py`](benchmark.py) — standalone load/test script, run manually against the live server
+- [`benchmark.py`](benchmark.py) — standalone load/test script, run manually against the live server (sequential by design)
+- [`load_test.py`](load_test.py) — genuinely concurrent load test (`asyncio.gather`), built to surface race conditions and real throughput/latency under concurrency, not just sequential numbers
 - [`test_failover.py`](test_failover.py) — standalone test script for the full three-tier failover chain
 - [`test_rate_limit.py`](test_rate_limit.py) — standalone test script for the rate limiter (unit-level + endpoint wiring)
 - [`analyze_ollama_stats.py`](analyze_ollama_stats.py) — breaks down Ollama's own load/eval timing per model from `gateway.db`
@@ -285,6 +292,43 @@ The test swaps in a smaller/faster limiter (3 requests / 3 seconds instead of pr
 
 **A real interaction worth knowing about:** [`benchmark.py`](benchmark.py) sends no `X-API-Key` header, so all 30 of its requests share the single `"anonymous"` bucket. At the default 10/60s, a fresh benchmark run can burn through the initial 10-request burst well within a minute and start hitting `429`s partway through. `benchmark.py`'s own per-request error handling (see the benchmark-crash incident note earlier in this section) will catch these as `FAIL` lines and keep going rather than crash, but the resulting hit-rate/latency numbers from a fresh run would no longer match the 5-run table above without either raising the limit, giving the benchmark its own header, or exempting it. Not fixed here since it wasn't asked for — flagged so a future re-run's numbers aren't a surprise.
 
+### Real concurrent load test
+
+Every other test script in this project (`benchmark.py`, `test_failover.py`, `test_rate_limit.py`'s Part 2) sends requests one at a time, deliberately - see `benchmark.py`'s own docstring on why. [`load_test.py`](load_test.py) is the exception: it fires genuinely concurrent requests via `asyncio.gather()` over one shared `httpx.AsyncClient`, specifically to answer questions a sequential test can't ask - does the semantic cache's `find()`-then-`add()` sequence race under real concurrency, does the rate limiter's token bucket hold up, and what does this CPU-only, single-Ollama-instance gateway actually do under concurrent load.
+
+Two waves, each internally concurrent (everything in a wave fires at the same instant via one `asyncio.gather`):
+
+- **Wave 1 (14 requests at once):** two duplicate-prompt groups - 4 exact copies of `"What is the capital of Italy?"`, and 4 already-validated paraphrases of `"What is the capital of Japan?"` (`benchmark.py`'s own "group A", confirmed there to reliably hit the cache sequentially) - plus 6 distinct routing-mix prompts (5 simple, 1 complex; capped at one complex prompt so a slow 3b call under contention couldn't stretch the wave out or risk tripping `OLLAMA_TIMEOUT_SECONDS`).
+- **Wave 2 (15 requests at once):** 15 distinct, short, keyword-free prompts (all route to `qwen2.5:1.5b`), all under one client key, sized to exceed `RATE_LIMIT_REQUESTS=10` on purpose.
+
+**Finding 1 — the semantic cache has a real, 100% reproducible race under concurrency, not a hypothetical one.** Both duplicate groups scored zero hits:
+```
+Group 'exact duplicate' (4 concurrent identical requests): 0 hits, 4 misses
+Group 'paraphrase'      (4 concurrent identical requests): 0 hits, 4 misses
+```
+`chat()` calls `cache.find()`, `await`s the backend call (40-100+ seconds under this test's contention), then calls `cache.add()`. Under concurrency, all 4 identical requests call `find()` and get a miss before any one of them has finished its backend call and reached `add()` - the race window (an entire generation) is vastly larger than the gap between the 4 requests' arrivals (milliseconds), so at this concurrency level the race isn't an edge case, it's the deterministic outcome. 8 requests that should have produced 2 real model calls + 6 near-instant hits instead produced 8 real model calls. **This means the cache-hit-latency-under-concurrency comparison this test was designed to make couldn't be made from this run** - there were zero concurrent hits to measure, and that absence is itself the finding, not a gap in the test.
+
+**Finding 2 — the rate limiter's own logic is race-free, confirmed by inspection and matched by the numbers, but a request rejected by it doesn't come back instantly under load.** `RateLimiter.check()` is a plain synchronous function with no `await` in it, called from a single-process asyncio event loop - no other coroutine can interleave between reading and updating a bucket's token count, so double-counted or lost tokens aren't possible here regardless of concurrency. Wave 2's result: **11 succeeded (200), 4 rejected (429)** against a capacity of 10 - not exactly a 10/5 split, because the bucket refills continuously (`capacity / window_seconds` tokens/sec) and enough time passed between the first and last request actually being *checked* (not sent - see below) for one extra token to regenerate; the 11th accepted request was the very last one in the batch, consistent with it being checked several seconds after the first ten. What's worth flagging honestly: the 4 rejected requests took **~8.8 seconds** of client-observed wall-clock time to come back with their 429, not the near-instant response you'd expect from a synchronous check running before anything else in `chat()`. The rate limiter's *logic* isn't the cause (verified above); the likely cause is queueing/scheduling delay elsewhere in the concurrent request path on this single-process event loop, but that wasn't root-caused further here - flagged as an open observation rather than asserted with more confidence than the evidence supports.
+
+**Finding 3 — Ollama re-paid a ~16-second model-load cost on every one of the 13 concurrent `qwen2.5:1.5b` calls in Wave 1, then paid under 100ms on all 11 in Wave 2.** `gateway.db`'s `load_duration_ms` column (Ollama's own self-reported load time, already used elsewhere in this README - see Phase 3/4) tells this story directly:
+```
+Wave 1 (13 concurrent 1.5b calls): load_duration_ms ≈ 16,000-16,124ms on EVERY one
+Wave 2 (11 concurrent 1.5b calls, sent ~100s later): load_duration_ms ≈ 22-71ms on EVERY one
+```
+`OllamaBackend` passes `keep_alive="30m"` on every request specifically to keep a model resident between calls (see `backends.py`), so this isn't a cold-start cost paid once - it was paid **13 times**, once per concurrent request, in the same wave. By Wave 2, with the model apparently settled from Wave 1's contention, all 11 concurrent calls loaded near-instantly. The most likely explanation is that simultaneous requests to the same model destabilize whatever Ollama does to keep it resident on this CPU-only setup - but the exact internal mechanism wasn't dug into further, so this is reported as observed behavior, not a root-caused explanation.
+
+**Throughput, latency, and what "concurrent" actually bought here:**
+```
+Wave 1: 14 requests / 104.5s wall-clock = 0.134 req/s   (sum of individual latencies: 787.2s -> 7.5x "serial equivalent" work in that wall time)
+Wave 2: 15 requests / 22.0s wall-clock  = 0.683 req/s   (11 successful / 22.0s = 0.501 req/s)
+
+Client-observed wall-clock latency, all 29 requests: p50=21,950ms  p95=59,901ms  p99=92,050ms
+Server-reported latency_ms, 25 successful requests:  p50=37,881ms  p95=54,999ms  p99=87,188ms
+```
+At n=29 (and n=25), p95/p99 are just the top one or two observations in this specific run, not stable percentiles - stated here as a caveat, not hidden. The more informative comparison is miss latency across contexts: the committed Run 3 snapshot's **sequential** average miss latency (mixed 1.5b/3b) was 40,389.6ms; Wave 1's **concurrent** `qwen2.5:1.5b` misses (paying the ~16s reload tax above) averaged **46,838.5ms** (n=13) - worse than the sequential mixed-model average despite 1.5b normally being much faster than 3b; Wave 2's concurrent `qwen2.5:1.5b` misses (model settled, no reload tax) averaged **8,872.4ms** (n=11) - back in a normal range for this model, if still elevated versus a single sequential call (Phase 2's `test_failover.py` measured 1,936.4ms for one). Concurrency on this CPU-only, single-Ollama-instance setup doesn't parallelize generation - it mostly adds contention.
+
+**Process note:** this run's `gateway.db` was archived to `runs/gateway_load_test_20260909T093848Z.db` and then restored to the clean Run 3 snapshot (this traffic - concurrent duplicates, deliberately-triggered 429s - is adversarial by design, not representative normal traffic, so it doesn't replace Run 3 as the committed baseline). The restore step caught a real bug in its first version: the archived Run 3 snapshot used for restoring predates the `failed_over`/`request_id`/`served_by` column migration, so a naive copy would have silently downgraded `gateway.db`'s schema back to 9 columns. Caught by diffing row content against `git show HEAD:gateway.db` after the first real run, not assumed correct - `load_test.py` now re-runs `db.py`'s migration immediately after restoring, and the restored file is now confirmed byte-identical to the committed one.
+
 ### Trained routing classifier (experimental, opt-in only)
 
 [`generate_eval_set.py`](generate_eval_set.py) produced 50 prompts with both models' real responses; I then judged each one by hand, in `eval_set.csv`'s `which_is_better` column, as `"1.5b"`, `"3b"`, `"tie"`, or `"neither"` (neither response was good). [`train_classifier.py`](train_classifier.py) turns that judgment into a routing classifier:
@@ -345,6 +389,7 @@ Plain accuracy says the classifier wins (0.653 vs 0.592). Balanced accuracy says
 ## Known limitations
 
 - **A request where all three backends fail is not logged anywhere.** The `502` path in `chat()` returns before calling `log_request()` — confirmed both by code inspection and by a live test with all three backends pointed at unreachable addresses (no `gateway.db` row was written). Every other outcome (cache hit, any successful tier, even a 400 from validation happening before this point) either logs or was never a "the system tried and failed" event in the first place; this one specific path is the exception, stated here rather than implied away.
+- **The semantic cache has a real, 100% reproducible race under concurrency.** `find()`-then-`add()` isn't atomic across the awaited backend call in between, so concurrent identical/near-duplicate requests can all miss before any of them finishes and caches its result - confirmed directly, not hypothesized, by [`load_test.py`](load_test.py) (see "Real concurrent load test" above: both test groups scored 0/4 hits). A per-prompt-hash lock (or a small in-flight-request registry that lets a duplicate arriving mid-flight await the same in-progress call instead of starting its own) would fix this; not built here since this MVP has always run under sequential/low-concurrency demo load, but it's a real gap now that it's been measured, not just theorized.
 - **The semantic cache has no size cap or eviction policy.** Persistence (see "Design decisions") means it also no longer resets on restart, which is progress, but the trade-off is that it now grows unbounded for as long as it keeps getting new entries — nothing prunes old or rarely-hit entries.
 - **Runs A, B, 1, and 2 (of the original 5-run benchmark set) have no preserved raw database.** The archiving mechanism (`runs/gateway_run_<timestamp>.db`) didn't exist yet when those were executed, so their numbers are transcribed from that session's printed summaries/logs, not re-derivable from a raw `gateway.db`. Every benchmark run from Run 3 onward is fully re-derivable from raw per-request rows instead.
 - **Everything was measured on one CPU-only machine** (Intel integrated graphics, no CUDA). The routing split and cache speedup direction should generalize; the absolute millisecond numbers are specific to this hardware and clearly move around with background load even on this one machine (see the benchmark's 400x–780x spread).
