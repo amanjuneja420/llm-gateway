@@ -79,14 +79,18 @@ def log_request(
     eval_count, and eval_duration_ms come from the backend's own response
     where it reports them (Ollama: all three; Groq: eval_count and
     eval_duration_ms; Gemini: neither) and are NULL otherwise. failed_over
-    is True whenever served_by isn't "ollama" - kept for backward
-    compatibility with the simpler two-tier Phase 1 framing. served_by is
-    the more precise field: "ollama" | "gemini" | "groq" | "cache",
-    recording which backend in the three-tier failover chain actually
-    served this response. request_id is the UUID main.py generated for
-    this request - the same value it returns in the response - so this row
-    can be matched back to a specific request instead of just a
-    timestamp."""
+    is True only when served_by is "gemini" or "groq" - NOT simply
+    "whenever served_by isn't 'ollama'", since served_by="cache" isn't
+    "ollama" either but a cache hit is the healthy fast path, not a
+    failover (see main.py's chat(), which sets this explicitly rather than
+    relying on that broader-sounding rule, for exactly this reason). Kept
+    alongside served_by for backward compatibility with the simpler
+    two-tier Phase 1 framing; served_by is the more precise field: "ollama"
+    | "gemini" | "groq" | "cache", recording which backend in the
+    three-tier failover chain actually served this response. request_id is
+    the UUID main.py generated for this request - the same value it
+    returns in the response - so this row can be matched back to a
+    specific request instead of just a timestamp."""
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
