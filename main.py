@@ -45,8 +45,31 @@ POST /chat opts into it for exactly one request, so both routers stay
 live and comparable side by side rather than one confidently replacing
 the other on this little evidence. Falls back to the heuristic (with
 router_mode reflecting what actually ran) if the pickle file is missing.
+
+POST /chat/stream: a streaming variant of /chat, motivated specifically by
+this being CPU-only hardware where a single qwen2.5:3b generation can take
+60+ seconds (measured earlier - see "Results & verification") - waiting
+that long for one lump response is a worse experience than watching tokens
+arrive as Ollama produces them, even though the total time is the same.
+This is NOT a general-purpose feature clone of /chat: it talks to Ollama
+directly (bypassing backends.py's Backend abstraction, which returns one
+complete response and isn't shaped for token-by-token output), checks the
+semantic cache first (a cache hit streams back as a single token event
+immediately - there's no reason to fake a slow stream for something
+already fully known), and applies the same rate limiting as /chat. It
+deliberately does NOT fail over to Gemini/Groq on an Ollama failure -
+falling back mid-stream would mean either buffering the whole cloud
+response before showing anything (defeating the point of streaming) or
+mixing partial local output with a restarted cloud response, both worse
+than a clean error event. It also does NOT support `?router=trained` -
+kept simple and heuristic-only, since this endpoint's job is proving out
+streaming, not re-implementing every /chat option. See chat_stream() below
+for the SSE event shapes and why a client disconnect mid-stream is never
+logged to gateway.db (a second, deliberate gap alongside /chat's
+all-backends-failed 502 path - see README's Known Limitations).
 """
 
+import json
 import os
 import pickle
 import time
@@ -57,6 +80,7 @@ from typing import Annotated
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from backends import GeminiBackend, GroqBackend, OllamaBackend
@@ -443,4 +467,155 @@ async def chat(
         failed_over=failed_over,
         router_mode=router_mode_used,
         request_id=request_id,
+    )
+
+
+def _sse_event(data: dict) -> str:
+    """One Server-Sent Events frame: `data: <json>\\n\\n`. A plain JSON
+    payload with an explicit "type" field ("token" | "done" | "error")
+    rather than a magic sentinel string (e.g. OpenAI-style "[DONE]") - a
+    client just parses every frame the same way and switches on "type"."""
+    return f"data: {json.dumps(data)}\n\n"
+
+
+@app.post("/chat/stream")
+async def chat_stream(
+    req: ChatRequest,
+    x_api_key: Annotated[str | None, Header(alias=RATE_LIMIT_HEADER)] = None,
+) -> StreamingResponse:
+    """
+    Streaming variant of /chat - see the module docstring's "POST
+    /chat/stream" section for why this exists and what it deliberately
+    doesn't do (no failover, no ?router=trained).
+
+    Event shapes (each an SSE `data: {...}` frame):
+      {"type": "token", "text": "..."}                                one per chunk of generated text
+      {"type": "done", "model_used", "cache_hit", "served_by",
+       "latency_ms", "request_id"}                                    exactly one, terminal
+      {"type": "error", "detail": "..."}                               terminal, in place of "done", if Ollama fails
+
+    Same rate limiting and input validation as /chat, checked before the
+    streaming response is even opened - a rejected request gets a normal
+    429/400 JSON response, not a stream.
+    """
+    client_key = x_api_key or ANONYMOUS_CLIENT_KEY
+    allowed, retry_after = rate_limiter.check(client_key)
+    if not allowed:
+        retry_after_seconds = max(1, round(retry_after))
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Rate limit exceeded: {rate_limiter.capacity:.0f} requests per "
+                f"{rate_limiter.window_seconds:.0f}s per {RATE_LIMIT_HEADER}. "
+                f"Retry after {retry_after_seconds}s."
+            ),
+            headers={"Retry-After": str(retry_after_seconds)},
+        )
+
+    request_id = str(uuid.uuid4())
+
+    if not req.prompt or not req.prompt.strip():
+        raise HTTPException(status_code=400, detail="prompt must not be empty or whitespace-only")
+    if len(req.prompt) > MAX_PROMPT_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"prompt exceeds MAX_PROMPT_LENGTH ({MAX_PROMPT_LENGTH} chars)",
+        )
+
+    start = time.perf_counter()
+    cached_entry, query_embedding = cache.find(req.prompt)
+
+    if cached_entry is not None:
+        # Cache hit: nothing to stream token-by-token, since the full
+        # response is already known - send it as one token event, then
+        # done, immediately. Logged before streaming starts since the
+        # full outcome is already known (unlike the miss path below).
+        latency_ms = (time.perf_counter() - start) * 1000
+        log_request(
+            req.prompt, "cache", True, latency_ms,
+            request_id=request_id, served_by="cache", failed_over=False,
+        )
+
+        async def cached_stream():
+            yield _sse_event({"type": "token", "text": cached_entry.response})
+            yield _sse_event({
+                "type": "done", "model_used": "cache", "cache_hit": True,
+                "served_by": "cache", "latency_ms": latency_ms, "request_id": request_id,
+            })
+
+        return StreamingResponse(
+            cached_stream(), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    routed_model = route(req.prompt)  # heuristic only - see module docstring
+
+    async def event_stream():
+        full_text_parts: list[str] = []
+        final_chunk: dict = {}
+        try:
+            async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_SECONDS) as client:
+                async with client.stream(
+                    "POST",
+                    OLLAMA_URL,
+                    json={
+                        "model": routed_model,
+                        "prompt": req.prompt,
+                        "stream": True,
+                        "keep_alive": "30m",
+                    },
+                ) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        chunk = json.loads(line)
+                        token = chunk.get("response", "")
+                        if token:
+                            full_text_parts.append(token)
+                            yield _sse_event({"type": "token", "text": token})
+                        if chunk.get("done"):
+                            final_chunk = chunk
+        except Exception as exc:
+            # Ollama failed mid-stream (or before it started) - no
+            # failover here (see module docstring for why), just a clean
+            # terminal error event. Nothing is cached or logged, same
+            # reasoning as /chat's all-backends-failed 502 path: there's
+            # no successful response to record.
+            yield _sse_event({"type": "error", "detail": f"{type(exc).__name__}: {exc}"})
+            return
+
+        # Reached only if the loop above ran to completion. If the client
+        # disconnects mid-stream instead, ASGI tears this generator down
+        # via GeneratorExit at whichever `yield` it was last suspended on
+        # - that propagates straight out (it's a BaseException, not caught
+        # by `except Exception` above) and everything below is simply
+        # never reached. That means a disconnected stream is never cached
+        # or logged to gateway.db - a second unlogged path alongside the
+        # 502 case above, deliberately not worked around by trying to log
+        # a partial response with no real eval_count/eval_duration from
+        # Ollama's own final chunk. See README's Known Limitations.
+        latency_ms = (time.perf_counter() - start) * 1000
+        full_text = "".join(full_text_parts)
+        load_duration_ms = final_chunk.get("load_duration", 0) / 1e6
+        eval_count = final_chunk.get("eval_count", 0)
+        eval_duration_ms = final_chunk.get("eval_duration", 0) / 1e6
+
+        cache.add(req.prompt, query_embedding, full_text, routed_model)
+        cache.save()  # see /chat's chat() for why this is synchronous and immediate, not shutdown-only
+
+        log_request(
+            req.prompt, routed_model, False, latency_ms,
+            load_duration_ms=load_duration_ms, eval_count=eval_count,
+            eval_duration_ms=eval_duration_ms, failed_over=False,
+            request_id=request_id, served_by="ollama",
+        )
+        yield _sse_event({
+            "type": "done", "model_used": routed_model, "cache_hit": False,
+            "served_by": "ollama", "latency_ms": latency_ms, "request_id": request_id,
+        })
+
+    return StreamingResponse(
+        event_stream(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

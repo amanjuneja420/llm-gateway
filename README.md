@@ -92,6 +92,12 @@ venv\Scripts\python load_test.py
 ```
 Fires genuinely concurrent requests (not sequential, unlike `benchmark.py`) to surface race conditions in the cache and rate limiter, plus real throughput/latency under concurrency — see "Real concurrent load test" under "Results & verification". Archives and restores `gateway.db` automatically, same pattern as `benchmark.py`.
 
+**7c. (Optional) try streaming:**
+```bash
+venv\Scripts\python test_streaming.py
+```
+Sends a real prompt to `POST /chat/stream` and prints each token as it arrives with a timestamp, then repeats the same prompt to show the cache-hit path — see "SSE streaming" under "Results & verification".
+
 **8. (Optional) Deeper analysis, once `gateway.db` has some data in it:**
 ```bash
 venv\Scripts\python analyze_ollama_stats.py       # load-time vs. generation-time breakdown per model
@@ -122,6 +128,7 @@ Prints cross-validated accuracy and a heuristic-vs-classifier comparison, and sa
 - [`benchmark.py`](benchmark.py) — standalone load/test script, run manually against the live server (sequential by design)
 - [`load_test.py`](load_test.py) — genuinely concurrent load test (`asyncio.gather`), built to surface race conditions and real throughput/latency under concurrency, not just sequential numbers
 - [`test_failover.py`](test_failover.py) — standalone test script for the full three-tier failover chain
+- [`test_streaming.py`](test_streaming.py) — real client test for `POST /chat/stream`, timestamping every SSE chunk to confirm tokens actually arrive incrementally
 - [`test_rate_limit.py`](test_rate_limit.py) — standalone test script for the rate limiter (unit-level + endpoint wiring)
 - [`analyze_ollama_stats.py`](analyze_ollama_stats.py) — breaks down Ollama's own load/eval timing per model from `gateway.db`
 - [`aggregate_benchmark_runs.py`](aggregate_benchmark_runs.py) — combines several `benchmark.py` runs' printed summaries into one table with min/max/avg speedup and hit rate
@@ -386,9 +393,31 @@ Plain accuracy says the classifier wins (0.653 vs 0.592). Balanced accuracy says
 
 **What's shipped as a result, matching that honest conclusion:** the heuristic stays the default. `router_classifier.pkl` (trained on all 49 rows, not held out) is loaded at startup if present, and `POST /chat?router=trained` opts a single request into it — `main.py`'s `route_prompt()` falls back to the heuristic if the pickle file is missing, and the response's `router_mode` field always says which one actually ran. Both are live and comparable side by side; nothing was swapped by default on ~49 labeled examples. Verified end to end against the running server: the same complex prompt routes to `qwen2.5:3b` under the default heuristic and to `qwen2.5:1.5b` under `?router=trained` — consistent with the classifier's majority-class collapse.
 
+### SSE streaming (`/chat/stream`)
+
+Motivated specifically by this being CPU-only hardware, not as a generic feature: a single `qwen2.5:3b` generation can take 60-100+ seconds (measured throughout this README), and waiting that long for one lump JSON response is a materially worse experience than watching tokens arrive as Ollama produces them, even though the total wall-clock time is identical either way. [`main.py`](main.py)'s `chat_stream()` talks to Ollama directly with `"stream": true` (bypassing `backends.py`'s `Backend` abstraction, which returns one complete response and isn't shaped for token-by-token output) and streams back Server-Sent Events - `{"type": "token", "text": "..."}` per chunk, one terminal `{"type": "done", ...}` or `{"type": "error", ...}`.
+
+**What it deliberately does and doesn't do, on purpose:** same rate limiting and input validation as `/chat`, checked before the stream even opens. It *does* check the semantic cache first - a hit streams back as a single token event (the full cached text) then done, essentially instantly, rather than skipping the cache and forcing every repeated prompt through a slow "streamed" re-generation, which would be a real behavior regression against `/chat` on the same gateway. It does **not** fail over to Gemini/Groq on an Ollama failure - falling back mid-stream would mean either buffering the whole cloud response before showing anything (defeating the point) or mixing partial local output with a restarted cloud response, both worse than a clean terminal error event - and it does **not** support `?router=trained`, kept heuristic-only since this endpoint's job is proving out streaming, not re-implementing every `/chat` option.
+
+**Real evidence it actually streams, not just returns the full thing under an SSE wrapper:** [`test_streaming.py`](test_streaming.py) uses httpx's `client.stream()` + `iter_lines()` (deliberately not a plain `client.post()`, which would buffer the whole body and make every chunk look simultaneous) and timestamps every chunk as it arrives:
+```
+Prompt: "Explain how photosynthesis works in plants, step by step."  (routes to qwen2.5:3b)
+  Total tokens received: 747
+  Time to first chunk:      3,772.1 ms
+  Time to done:            74,418.4 ms
+  Inter-chunk gaps:      min=56.2ms  max=325.4ms  avg=94.6ms
+  747/747 gaps are > 1ms apart - tokens arrived spread out over real time
+```
+Every single one of 747 chunks arrived at a measurably later timestamp than the one before it - real incremental delivery, not an artifact of the test. A client watching this stream sees the first word at 3.8 seconds; a client waiting on non-streaming `/chat` for the same generation would see nothing at all until 74.4 seconds.
+
+**The same prompt sent again** (now cached) confirms the cache-check path: one token event carrying the full 3,419-character cached response, `served_by: "cache"`, server-reported `latency_ms: 66.09` - in the same range as this project's other cache hits (Run 3's sequential average: 91.72ms). The test script's own "time to first chunk" for this case shows ~2.6 seconds, but that's the test client's own new-connection overhead on this Windows setup (confirmed separately via `curl -v`, which shows every request trying `[::1]` first and timing out before falling back to `127.0.0.1`), not the gateway's - the `latency_ms` field in the payload is the number that reflects what the gateway itself actually did.
+
+**A second unlogged path, alongside `/chat`'s all-backends-failed 502 (see Known Limitations):** if the client disconnects mid-stream, ASGI tears the generator down via `GeneratorExit` at whichever `yield` it was suspended on, which propagates straight past the cache-write and `log_request()` call at the end of `event_stream()` - a disconnected stream is never cached or logged. This was verified by accident during testing: an early version of `test_streaming.py` crashed mid-stream on a Windows console encoding error partway through receiving a response containing "H₂O", and the gateway's `cache_size` stayed at 0 afterward - exactly the documented behavior, not a bug in the endpoint.
+
 ## Known limitations
 
 - **A request where all three backends fail is not logged anywhere.** The `502` path in `chat()` returns before calling `log_request()` — confirmed both by code inspection and by a live test with all three backends pointed at unreachable addresses (no `gateway.db` row was written). Every other outcome (cache hit, any successful tier, even a 400 from validation happening before this point) either logs or was never a "the system tried and failed" event in the first place; this one specific path is the exception, stated here rather than implied away.
+- **A `/chat/stream` request that disconnects mid-stream is also never logged.** Same reasoning as the point above: `GeneratorExit` tears down the generator before it reaches its own cache-write/`log_request()` call - confirmed by accident during testing (see "SSE streaming" above), not just asserted from reading the code.
 - **The semantic cache has a real, 100% reproducible race under concurrency.** `find()`-then-`add()` isn't atomic across the awaited backend call in between, so concurrent identical/near-duplicate requests can all miss before any of them finishes and caches its result - confirmed directly, not hypothesized, by [`load_test.py`](load_test.py) (see "Real concurrent load test" above: both test groups scored 0/4 hits). A per-prompt-hash lock (or a small in-flight-request registry that lets a duplicate arriving mid-flight await the same in-progress call instead of starting its own) would fix this; not built here since this MVP has always run under sequential/low-concurrency demo load, but it's a real gap now that it's been measured, not just theorized.
 - **The semantic cache has no size cap or eviction policy.** Persistence (see "Design decisions") means it also no longer resets on restart, which is progress, but the trade-off is that it now grows unbounded for as long as it keeps getting new entries — nothing prunes old or rarely-hit entries.
 - **Runs A, B, 1, and 2 (of the original 5-run benchmark set) have no preserved raw database.** The archiving mechanism (`runs/gateway_run_<timestamp>.db`) didn't exist yet when those were executed, so their numbers are transcribed from that session's printed summaries/logs, not re-derivable from a raw `gateway.db`. Every benchmark run from Run 3 onward is fully re-derivable from raw per-request rows instead.
@@ -399,6 +428,5 @@ Plain accuracy says the classifier wins (0.653 vs 0.592). Balanced accuracy says
 
 ## What I'd build next
 
-- SSE streaming for the `/chat` response
 - More labeled routing examples — the real bottleneck for the trained classifier, not a different model or algorithm. A few hundred judged prompts, not 49, is the next thing to try before concluding a learned router can't help here.
 - A small dashboard over `gateway.db` instead of querying it by hand
