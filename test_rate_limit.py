@@ -25,19 +25,67 @@ README.md) is comparable to or larger than a short test window, so a
 partially refills between requests, and the timing becomes unreliable to
 assert on. Testing the algorithm in isolation first, then only checking
 the wiring with real calls, avoids that entirely.
+
+Cache state protection: this script does `import main` directly, which
+never triggers FastAPI's `lifespan()` - so `main.cache` starts completely
+empty, regardless of what's actually persisted in cache_state.npz/.json
+on disk (same class of gap as init_db()'s migration needing an explicit
+call in test_failover.py, since lifespan() doesn't fire on a direct
+import either). Part 2's two real chat() calls are real cache misses
+against that empty in-memory cache, and each one calls cache.add() then
+cache.save() - which does a full overwrite of cache_state.npz/.json, not
+a merge. Left alone, running this test would silently replace a real
+persisted cache with just this test's 1-2 throwaway entries. Fixed the
+same way gateway.db's state is protected around load_test.py's
+adversarial traffic: back up cache_state.npz/.json before running,
+restore them (or remove them if they didn't exist) in a `finally`,
+regardless of whether the test passes, fails, or crashes.
 """
 
 import asyncio
+import os
+import shutil
 import time
 
 from fastapi import HTTPException
 
 import main
+from cache import CACHE_STATE_PATH
 from rate_limiter import RateLimiter
 
 TEST_CAPACITY = 3
 TEST_WINDOW_SECONDS = 3.0
 TEST_CLIENT_KEY = "test-client-key-for-rate-limit-check"
+
+CACHE_NPZ_PATH = f"{CACHE_STATE_PATH}.npz"
+CACHE_JSON_PATH = f"{CACHE_STATE_PATH}.json"
+CACHE_BACKUP_SUFFIX = ".rate_limit_test_backup"
+
+
+def backup_cache_state() -> dict[str, bool]:
+    """Back up cache_state.npz/.json (if present) before this test's real
+    chat() calls can overwrite them. Returns which paths existed, so
+    restore_cache_state() knows whether to restore a backup or delete a
+    file this test created from nothing."""
+    existed = {}
+    for path in (CACHE_NPZ_PATH, CACHE_JSON_PATH):
+        existed[path] = os.path.exists(path)
+        if existed[path]:
+            shutil.copy2(path, path + CACHE_BACKUP_SUFFIX)
+    return existed
+
+
+def restore_cache_state(existed: dict[str, bool]) -> None:
+    """Undo whatever this test run did to cache_state.npz/.json: restore
+    the backed-up original if one existed before, or remove the file this
+    test created if there wasn't one - either way, on-disk cache state
+    ends up exactly as it was before this test ran."""
+    for path, had_existed in existed.items():
+        backup_path = path + CACHE_BACKUP_SUFFIX
+        if had_existed:
+            shutil.move(backup_path, path)
+        elif os.path.exists(path):
+            os.remove(path)
 
 
 def test_token_bucket_unit() -> bool:
@@ -120,8 +168,12 @@ async def test_chat_endpoint_enforces_limit() -> bool:
 
 
 async def main_async() -> None:
-    unit_passed = test_token_bucket_unit()
-    wiring_passed = await test_chat_endpoint_enforces_limit()
+    cache_existed = backup_cache_state()
+    try:
+        unit_passed = test_token_bucket_unit()
+        wiring_passed = await test_chat_endpoint_enforces_limit()
+    finally:
+        restore_cache_state(cache_existed)
 
     print("\n" + "=" * 60)
     print("RATE LIMIT TEST SUMMARY")
@@ -129,6 +181,10 @@ async def main_async() -> None:
     print(f"  {'PASS' if unit_passed else 'FAIL':<6} token bucket (unit, isolated)")
     print(f"  {'PASS' if wiring_passed else 'FAIL':<6} chat() endpoint enforcement (real requests)")
     print("=" * 60)
+    print(
+        "\ncache_state.npz/.json restored to their pre-test state - this test's "
+        "2 real chat() calls never persist (see module docstring)."
+    )
 
 
 if __name__ == "__main__":
