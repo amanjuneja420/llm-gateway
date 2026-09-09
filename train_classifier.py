@@ -32,7 +32,12 @@ What this does, in order:
 5. Compute what the EXISTING heuristic router (router.py) would have
    predicted for the same rows, and report its accuracy against the same
    ground truth - side by side with the classifier's cross-validated
-   accuracy, honestly, whichever way it comes out.
+   accuracy, honestly, whichever way it comes out. Plain accuracy alone is
+   misleading on this 32/17-imbalanced label set (a model that always
+   guesses "1.5b" scores well without learning anything), so this also
+   reports balanced accuracy (mean of per-class recall) and a full
+   per-class precision/recall/F1 classification_report for both the
+   classifier and the heuristic - the fairer side-by-side comparison.
 6. Save the final classifier (trained on all available rows, not just
    one fold) to router_classifier.pkl. This is a small artifact this
    project creates and trusts itself, unlike the semantic cache's
@@ -47,7 +52,12 @@ from collections import Counter
 
 import numpy as np
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, confusion_matrix
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
+)
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
 
 from cache import SemanticCache
@@ -160,6 +170,25 @@ def main() -> None:
     for i, row_label in enumerate(labels_order):
         print(f"  {'actual ' + row_label:>10}{cm[i][0]:>12}{cm[i][1]:>10}")
 
+    # Plain accuracy rewards the classifier for guessing the majority label
+    # correctly 32 times, same as it would reward a model that learned
+    # nothing at all - on a 32/17 imbalanced set that's not a fair read.
+    # Balanced accuracy (mean of per-class recall) and per-class
+    # precision/recall/F1 don't have that blind spot: a model that never
+    # once predicts the minority class gets penalized for it directly,
+    # rather than that failure being averaged away by the majority class's
+    # size. zero_division=0 because "3b" has zero predicted samples here -
+    # its precision is undefined, not 1.0 or 0.0, and 0 is the conventional
+    # choice to report that without sklearn's UndefinedMetricWarning noise.
+    classifier_balanced_acc = balanced_accuracy_score(y, y_pred_oof)
+    print(f"\n  Balanced accuracy (OOF): {classifier_balanced_acc:.3f}")
+    print("  Per-class precision/recall/F1 (OOF):")
+    print(
+        classification_report(
+            y, y_pred_oof, labels=labels_order, zero_division=0, digits=3
+        )
+    )
+
     # Explicit check for a degenerate majority-class predictor - easy to
     # miss by eyeballing the confusion matrix above, but it changes what
     # the accuracy number actually means. At 49 examples with a 32/17
@@ -192,28 +221,50 @@ def main() -> None:
     for i, row_label in enumerate(labels_order):
         print(f"  {'actual ' + row_label:>10}{heuristic_cm[i][0]:>12}{heuristic_cm[i][1]:>10}")
 
+    heuristic_balanced_acc = balanced_accuracy_score(y, heuristic_pred)
+    print(f"\n  Heuristic balanced accuracy: {heuristic_balanced_acc:.3f}")
+    print("  Heuristic per-class precision/recall/F1:")
+    print(
+        classification_report(
+            y, heuristic_pred, labels=labels_order, zero_division=0, digits=3
+        )
+    )
+
     print(f"\n{'=' * 64}")
     print("THE COMPARISON THAT ACTUALLY MATTERS".center(64))
     print("=" * 64)
-    print(f"  Heuristic router accuracy:              {heuristic_acc:.3f}")
-    print(f"  Trained classifier accuracy (CV):       {mean_acc:.3f}  (std: {std_acc:.3f})")
-    print(f"  Majority-class baseline ('always 1.5b'): {majority_baseline_acc:.3f}")
+    print("  Plain accuracy (misleading here - see below):")
+    print(f"    Heuristic router accuracy:               {heuristic_acc:.3f}")
+    print(f"    Trained classifier accuracy (CV):        {mean_acc:.3f}  (std: {std_acc:.3f})")
+    print(f"    Majority-class baseline ('always 1.5b'): {majority_baseline_acc:.3f}")
+    print("\n  Balanced accuracy (mean of per-class recall - the fair comparison")
+    print("  on a 32/17 imbalanced label set; a model that never predicts the")
+    print("  minority class can't hide behind the majority class's size here):")
+    print(f"    Heuristic balanced accuracy:              {heuristic_balanced_acc:.3f}")
+    print(f"    Trained classifier balanced accuracy:     {classifier_balanced_acc:.3f}")
+    if classifier_balanced_acc > heuristic_balanced_acc:
+        print("\n  -> By balanced accuracy, the trained classifier beats the heuristic.")
+    elif classifier_balanced_acc < heuristic_balanced_acc:
+        print(
+            "\n  -> By balanced accuracy, the heuristic beats the trained classifier -\n"
+            "     the OPPOSITE conclusion from plain accuracy above. Plain accuracy\n"
+            "     rewarded the classifier for guessing the majority label correctly\n"
+            "     32 times; balanced accuracy penalizes it directly for never once\n"
+            "     predicting the minority class ('3b'), which plain accuracy on an\n"
+            "     imbalanced set otherwise averages away. This is the more honest\n"
+            "     number, and the one that should decide which router to trust."
+        )
+    else:
+        print("\n  -> Dead even on balanced accuracy.")
     if n_predicted_3b == 0:
         print(
-            "\n  -> The classifier's CV accuracy is not real evidence it beats the\n"
-            "     heuristic: it collapsed to predicting the majority class every\n"
-            "     time (see the WARNING above), and its accuracy is essentially\n"
-            "     identical to the majority-class baseline. The honest reading of\n"
-            "     this data is that 49 examples were not enough for logistic\n"
-            "     regression on 384-dim embeddings to learn a routing signal -\n"
-            "     not that the classifier is better than the heuristic."
+            "\n  The classifier collapsed to predicting the majority class every\n"
+            "  single time (see the WARNING and the 0.500 balanced accuracy above -\n"
+            "  0.500 is exactly what a coin flip between the two classes would\n"
+            "  score). The honest reading of this data is that 49 examples were not\n"
+            "  enough for logistic regression on 384-dim embeddings to learn a real\n"
+            "  routing signal, not that the classifier is a better router."
         )
-    elif mean_acc > heuristic_acc:
-        print("  -> The trained classifier beats the heuristic on this data.")
-    elif mean_acc < heuristic_acc:
-        print("  -> The heuristic beats the trained classifier on this data.")
-    else:
-        print("  -> Dead even on this data.")
     print(
         "\n  Reported honestly either way - see README.md's methodology "
         "note on what ~49 examples can and can't tell us here."

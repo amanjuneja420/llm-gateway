@@ -309,13 +309,36 @@ The test swaps in a smaller/faster limiter (3 requests / 3 seconds instead of pr
 
 **The honest finding, not the flattering one:** the confusion matrix shows the classifier predicted `"1.5b"` for every single one of the 49 rows across all folds — zero `"3b"` predictions, ever. The majority-class baseline (always guess `"1.5b"`, learn nothing) is `32/49 = 0.653` — identical to the reported mean CV accuracy to three decimal places. `LogisticRegression`'s default L2 regularization was deliberately left on (49 examples with 384-dim embeddings is a real small-n-large-p regime; disabling it would overfit, not help), and the model still collapsed to the majority class rather than finding a usable signal in the embeddings.
 
+**Plain accuracy alone is the wrong metric here, and using the right one flips the conclusion.** `train_classifier.py` also reports `balanced_accuracy_score` (mean of per-class recall) and a full `classification_report` for both routers, because on a 32/17-imbalanced label set, plain accuracy rewards a model for guessing the majority label correctly without it having learned anything — exactly what happened above.
+
+```
+Per-class precision/recall/F1, trained classifier (OOF):
+              precision    recall  f1-score   support
+        1.5b      0.653     1.000     0.790        32
+          3b      0.000     0.000     0.000        17
+    accuracy                          0.653        49
+   macro avg      0.327     0.500     0.395        49
+
+Per-class precision/recall/F1, heuristic:
+              precision    recall  f1-score   support
+        1.5b      0.750     0.562     0.643        32
+          3b      0.440     0.647     0.524        17
+    accuracy                          0.592        49
+   macro avg      0.595     0.605     0.583        49
+```
+
 **The comparison that actually matters — done side by side, reported whichever way it goes:**
 ```
-  Heuristic router accuracy:              0.592
-  Trained classifier accuracy (CV):       0.653  (std: 0.045)
-  Majority-class baseline ('always 1.5b'): 0.653
+  Plain accuracy (misleading here):
+    Heuristic router accuracy:               0.592
+    Trained classifier accuracy (CV):        0.653  (std: 0.045)
+    Majority-class baseline ('always 1.5b'): 0.653
+
+  Balanced accuracy (the fair comparison on this imbalanced set):
+    Heuristic balanced accuracy:              0.605
+    Trained classifier balanced accuracy:     0.500
 ```
-The classifier's number is numerically higher than the heuristic's, but that comparison is misleading on its own: the classifier isn't beating the heuristic by routing anything correctly that the heuristic gets wrong — it's just that guessing the majority label happens to score higher than the heuristic does on this particular 65/35-imbalanced sample of 49 prompts. The honest conclusion is that 49 examples was not enough data for logistic regression on sentence embeddings to learn a real routing signal here, not that the classifier is the better router.
+Plain accuracy says the classifier wins (0.653 vs 0.592). Balanced accuracy says the **opposite** — the heuristic wins (0.605 vs 0.500) — and 0.500 is exactly what a coin flip between the two labels would score. That reversal is the actual finding: the classifier isn't beating the heuristic by routing anything correctly that the heuristic gets wrong; it only looks better on plain accuracy because guessing the majority label happens to score well on a 65/35-imbalanced sample. The heuristic, imperfect as it is, at least tries to identify some "3b" prompts (recall 0.647 on that class) — the classifier never does (recall 0.000). The honest conclusion is that 49 examples was not enough data for logistic regression on sentence embeddings to learn a real routing signal here, not that the classifier is the better router — and balanced accuracy is the metric that actually shows that, rather than requiring a caveat paragraph to explain away a misleading headline number.
 
 **What's shipped as a result, matching that honest conclusion:** the heuristic stays the default. `router_classifier.pkl` (trained on all 49 rows, not held out) is loaded at startup if present, and `POST /chat?router=trained` opts a single request into it — `main.py`'s `route_prompt()` falls back to the heuristic if the pickle file is missing, and the response's `router_mode` field always says which one actually ran. Both are live and comparable side by side; nothing was swapped by default on ~49 labeled examples. Verified end to end against the running server: the same complex prompt routes to `qwen2.5:3b` under the default heuristic and to `qwen2.5:1.5b` under `?router=trained` — consistent with the classifier's majority-class collapse.
 
