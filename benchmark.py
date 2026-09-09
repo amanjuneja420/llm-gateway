@@ -36,9 +36,20 @@ DB_PATH = "gateway.db"
 RUNS_DIR = "runs"
 
 # 30 prompts total. Comments mark the paraphrase groups (near-duplicates of
-# an earlier prompt in the list) - these are the ones expected to produce
-# cache hits. Groups are deliberately spread out rather than sent back to
-# back, closer to how duplicate questions would actually arrive in traffic.
+# an earlier prompt in the list) - most of these produce real cache hits
+# (confirmed against every run's actual output, e.g. benchmark_run_1.log/
+# benchmark_run_3.log). Four are marked "-> MISSES in practice" instead:
+# real cosine similarity against their intended pair, measured directly
+# with cache.py's own embedding model, lands just under
+# SIMILARITY_THRESHOLD = 0.92 - not a labeling mistake (these genuinely are
+# the intended paraphrase of an earlier prompt, topically and structurally),
+# a real threshold-tuning finding. Left as still-real misses rather than
+# reworded to force a hit or silently "fixed": they're accurate evidence of
+# where 0.92 draws the line, consistent with every actual benchmark run,
+# and changing the wording now would make future runs incomparable to
+# every run already reported in README.md. Groups are deliberately spread
+# out rather than sent back to back, closer to how duplicate questions
+# would actually arrive in traffic.
 PROMPTS = [
     "What is the capital of Japan?",  # group A (capital-of-Japan) #1
     "Explain how photosynthesis works in plants.",  # group C (photosynthesis) #1
@@ -50,12 +61,12 @@ PROMPTS = [
     "Why do seasons change throughout the year?",
     "Can you tell me Japan's capital?",  # group A #3 -> expect cache hit
     "What year did World War II end?",
-    "What are the pros and cons of remote work compared to working in an office?",  # group D #2 -> expect cache hit
+    "What are the pros and cons of remote work compared to working in an office?",  # group D #2 -> MISSES in practice (real similarity 0.874, below 0.92)
     "What is the chemical symbol for gold?",
     "Which planet is the biggest in our solar system?",  # group B #2 -> expect cache hit
     "What are the steps to bake a basic loaf of bread from scratch?",
     "List the days of the week.",
-    "Can you explain the process of photosynthesis in plants?",  # group C #2 -> expect cache hit
+    "Can you explain the process of photosynthesis in plants?",  # group C #2 -> MISSES in practice (real similarity 0.9149, just under 0.92)
     "Translate 'hello' to Spanish.",
     "Analyze the causes of the fall of the Roman Empire.",
     "Tell me the largest planet in the solar system.",  # group B #3 -> expect cache hit
@@ -63,7 +74,7 @@ PROMPTS = [
     "What is the difference between machine learning and deep learning?",
     "What's Japan's capital city called?",  # group A #4 -> expect cache hit
     "Evaluate the pros and cons of electric vehicles compared to gasoline cars.",
-    "How does photosynthesis work?",  # group C #3 -> expect cache hit (shorter phrasing)
+    "How does photosynthesis work?",  # group C #3 (shorter phrasing) -> MISSES in practice (real similarity 0.9169, just under 0.92)
     "What is the tallest mountain in the world?",  # group E (tallest-mountain) #1
     (
         "I've been thinking about switching careers into software "
@@ -72,7 +83,7 @@ PROMPTS = [
     ),
     "What is the boiling point of water in Celsius?",
     "How do seasons change during the year?",  # paraphrase of the "why do seasons change" prompt
-    "What's the highest mountain on Earth?",  # group E #2 -> expect cache hit
+    "What's the highest mountain on Earth?",  # group E #2 -> MISSES in practice (real similarity 0.8981, below 0.92)
     "Contrast the benefits of solar power and wind power for home energy use.",
 ]
 
