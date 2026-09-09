@@ -13,6 +13,7 @@ MVP / demo-sized cache (dozens to low thousands of entries) and keeps the
 whole thing inspectable in about 60 lines.
 """
 
+import asyncio
 import json
 import os
 from dataclasses import dataclass
@@ -105,28 +106,55 @@ class SemanticCache:
     def __len__(self) -> int:
         return len(self._prompts)
 
-    def save(self, path: str = CACHE_STATE_PATH) -> int:
+    async def save(self, path: str = CACHE_STATE_PATH) -> int:
         """
         Persist the cache to <path>.npz (embeddings, stacked into one
         matrix) and <path>.json (the parallel prompt/response/model_used
-        lists). Called on server shutdown so the cache survives a restart
-        instead of starting empty every time. Returns the number of
-        entries saved (0 and no files written if the cache is empty).
+        lists). Called after every new entry (see main.py's chat()), not
+        just on shutdown - see the module-level note on why - so this
+        needs to not block the event loop on every single request.
+        Returns the number of entries saved (0 and no files written if the
+        cache is empty).
+
+        np.savez()/json.dump() are both synchronous, blocking file I/O -
+        run directly on the event loop (as this method used to, before it
+        was async), every one of these calls stalls every other in-flight
+        coroutine (including a different request's own rate-limit check
+        or cache lookup) for however long the write takes. Fixed by
+        snapshotting the data to save synchronously first (cheap - a numpy
+        stack and three list copies, no I/O, and nothing here awaits
+        anything, so no other coroutine can mutate self._embeddings/
+        _prompts/etc. mid-snapshot), then handing the actual slow disk
+        writes to a worker thread via asyncio.to_thread() so the event
+        loop stays free while they run.
+
+        Debouncing/batching saves instead (write every N entries, or on a
+        timer) was the other option, but was rejected: it directly
+        conflicts with why this method is called after every single entry
+        in the first place (see cache_state persistence's own module note -
+        a shutdown-only or infrequent save defeats surviving a crash,
+        which is the case that matters most at this project's scale). A
+        threaded write keeps that guarantee - every entry still gets
+        persisted immediately - while just moving the blocking part off
+        the loop.
         """
         if not self._embeddings:
             return 0
         matrix = np.vstack(self._embeddings)
-        np.savez(f"{path}.npz", embeddings=matrix)
-        with open(f"{path}.json", "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "prompts": self._prompts,
-                    "responses": self._responses,
-                    "models_used": self._models_used,
-                },
-                f,
-            )
-        return len(self._prompts)
+        prompts = list(self._prompts)
+        responses = list(self._responses)
+        models_used = list(self._models_used)
+
+        def _write() -> None:
+            np.savez(f"{path}.npz", embeddings=matrix)
+            with open(f"{path}.json", "w", encoding="utf-8") as f:
+                json.dump(
+                    {"prompts": prompts, "responses": responses, "models_used": models_used},
+                    f,
+                )
+
+        await asyncio.to_thread(_write)
+        return len(prompts)
 
     def load(self, path: str = CACHE_STATE_PATH) -> int:
         """

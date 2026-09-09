@@ -228,7 +228,7 @@ async def lifespan(app: FastAPI):
     if loaded:
         print(f"Loaded {loaded} cache entries from disk (cache_state.json/.npz)")
     yield
-    saved = cache.save()
+    saved = await cache.save()
     if saved:
         print(f"Saved {saved} cache entries to disk (cache_state.json/.npz)")
 
@@ -439,10 +439,11 @@ async def chat(
     # Persist immediately rather than only on clean shutdown (see lifespan()
     # above) - a crash or force-kill doesn't fire ASGI shutdown handlers, and
     # in practice that's exactly when you'd most want the cache not to be
-    # lost. At this cache's demo scale (dozens to low hundreds of entries),
-    # rewriting the whole file after every new entry is cheap enough not to
-    # matter for latency.
-    cache.save()
+    # lost. save() snapshots synchronously then writes in a worker thread
+    # (see cache.py) specifically so this full-file rewrite on every new
+    # entry doesn't block the event loop - it turned out NOT to be cheap
+    # enough to ignore, see README's Known Limitations on this.
+    await cache.save()
 
     latency_ms = (time.perf_counter() - start) * 1000
     log_request(
@@ -602,7 +603,7 @@ async def chat_stream(
         eval_duration_ms = final_chunk.get("eval_duration", 0) / 1e6
 
         cache.add(req.prompt, query_embedding, full_text, routed_model)
-        cache.save()  # see /chat's chat() for why this is synchronous and immediate, not shutdown-only
+        await cache.save()  # see /chat's chat() for why this is immediate, not shutdown-only, and why it's awaited (runs the actual write in a thread)
 
         log_request(
             req.prompt, routed_model, False, latency_ms,

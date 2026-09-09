@@ -21,30 +21,38 @@ benchmark.py's sequential design can't:
     CPU-only, one-Ollama-instance gateway is hit with concurrent traffic,
     not one request at a time?
 
-Three waves, each internally concurrent (one asyncio.gather per wave), run
-one after another so each wave's results are easy to reason about in
-isolation. All prompts within a wave are fired at the same instant, not
-staggered - "concurrent" here means what asyncio.gather actually gives you,
-not a polite ramp-up.
+Two actual concurrent waves in the code (asyncio.gather, one call each),
+covering three conceptual groups of prompts between them - described
+separately below because each group targets a different question, even
+though the first two groups are fired as ONE combined wave (see the note
+after "routing mix" for why), run one after another so results stay easy
+to reason about. All prompts within a wave are fired at the same instant,
+not staggered - "concurrent" here means what asyncio.gather actually
+gives you, not a polite ramp-up.
 
-  Wave 1 ("cache race"): two groups of intentionally duplicate prompts (one
+  "Cache race" group: two groups of intentionally duplicate prompts (one
   exact-duplicate group, one paraphrase group already validated to hit the
-  cache in benchmark.py's sequential run) fired concurrently, 8 requests
-  total, client key "loadtest-cache". If the cache's find()/add() sequence
-  is race-free under concurrency, each group should still end up with
-  exactly 1 miss + 3 hits, same as it would sequentially. If it races,
-  more than one request per group will miss and trigger its own real
-  Ollama call.
+  cache in benchmark.py's sequential run), 8 requests total, client key
+  "loadtest-cache". If the cache's find()/add() sequence is race-free
+  under concurrency, each group should still end up with exactly 1 miss +
+  3 hits, same as it would sequentially. If it races, more than one
+  request per group will miss and trigger its own real Ollama call.
 
-  Wave 2 ("routing mix"): 6 distinct prompts (5 simple, 1 complex - capped
-  at 1 complex prompt deliberately, since a 3b call under concurrent
+  "Routing mix" group: 6 distinct prompts (5 simple, 1 complex - capped at
+  1 complex prompt deliberately, since a 3b call under concurrent
   contention risks exceeding OLLAMA_TIMEOUT_SECONDS=120s and cascading
-  into a real Gemini/Groq call), client key "loadtest-routing", fired
-  concurrently in the same moment as wave 1 could have been but is kept
-  separate here for clean per-wave analysis (see WAVE1_AND_2_TOGETHER
-  below for why they're combined into one gather() anyway).
+  into a real Gemini/Groq call), client key "loadtest-routing". Fired in
+  the SAME asyncio.gather() as the cache-race group above, not a separate
+  wave - deliberately, for two reasons: the two groups use different
+  client keys so they can't cross-contaminate each other's rate-limit
+  buckets, and combining them makes the concurrency this wave exercises
+  more realistic (a mixed cache-race-plus-routing workload hitting the
+  gateway at the same instant, not an artificially cache-only burst) while
+  also finishing in one wave's wall-clock time instead of two sequential
+  ones. See main()'s wave1_requests construction for exactly how they're
+  concatenated before the one run_wave() call.
 
-  Wave 3 ("rate limit stress"): 15 distinct, deliberately short/simple
+  "Rate limit stress" wave (the second, separate asyncio.gather call): 15 distinct, deliberately short/simple
   prompts (no complexity keywords, well under WORD_COUNT_THRESHOLD, so all
   route to qwen2.5:1.5b and none can accidentally take the slow 3b path),
   all sent under ONE client key "loadtest-ratelimit", fired concurrently.
@@ -404,12 +412,13 @@ async def main() -> None:
         print("    avg=91.72ms  min=38.68ms  max=200.78ms  n=6  (queried directly from gateway.db before this test)")
         if avg_hit_latency > 200:
             print(
-                "    Concurrent cache hits are noticeably slower than sequential ones - "
-                "consistent with cache.save()'s full two-file rewrite running "
-                "synchronously in the event loop on every miss, and/or the "
-                "synchronous sqlite3 log_request() write, both blocking other "
-                "in-flight coroutines momentarily while a neighboring request "
-                "completes its own miss."
+                "    Concurrent cache hits are noticeably slower than sequential ones. "
+                "cache.save() no longer blocks the event loop on every miss (it now "
+                "snapshots synchronously, then writes in a worker thread via "
+                "asyncio.to_thread - see cache.py), so this is more likely the "
+                "synchronous sqlite3 log_request() write (not yet fixed the same way) "
+                "blocking other in-flight coroutines momentarily while a neighboring "
+                "request completes its own miss."
             )
         else:
             print("    Concurrent cache-hit latency is in the same range as the sequential baseline.")
