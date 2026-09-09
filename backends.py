@@ -49,6 +49,13 @@ class Backend(ABC):
         anything itself."""
         raise NotImplementedError
 
+    async def aclose(self) -> None:
+        """Release this backend's shared HTTP client's connection pool -
+        call once, on server shutdown (see main.py's lifespan()). Concrete,
+        not abstract: every backend below holds its client the same way
+        (self._client), so one implementation covers all three."""
+        await self._client.aclose()
+
 
 class OllamaBackend(Backend):
     """One Ollama model. Each router-selectable model (qwen2.5:1.5b,
@@ -68,6 +75,17 @@ class OllamaBackend(Backend):
         self.model = model
         self.base_url = base_url
         self.timeout = timeout
+        # One shared client for every generate() call this instance ever
+        # makes (main.py constructs one OllamaBackend per router-selectable
+        # model, once, at module load, and keeps them for the whole
+        # process) - not a new httpx.AsyncClient() (and its own fresh
+        # TCP/TLS handshake) per request. Constructing an AsyncClient() is
+        # plain object setup, no network I/O and no running event loop
+        # required, so this is safe here in __init__. self.base_url is
+        # still read fresh on every call below (not baked into the
+        # client), so test_failover.py's runtime `backend.base_url = ...`
+        # monkeypatching still works exactly as before.
+        self._client = httpx.AsyncClient(timeout=self.timeout)
 
     async def generate(self, prompt: str) -> BackendResponse:
         # keep_alive="30m" is passed explicitly on every request so the
@@ -83,10 +101,9 @@ class OllamaBackend(Backend):
             "stream": False,
             "keep_alive": "30m",
         }
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(self.base_url, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+        resp = await self._client.post(self.base_url, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
 
         # Ollama reports these in nanoseconds (eval_count is a plain token
         # count, not a duration) - convert to ms so they're directly
@@ -111,6 +128,11 @@ class GeminiBackend(Backend):
         self.api_key = api_key
         self.timeout = timeout
         self.url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        # Shared across every generate() call - see OllamaBackend's __init__
+        # for the full reasoning. Especially worth it here versus a
+        # localhost Ollama call: a fresh httpx.AsyncClient() per call means
+        # a fresh TLS handshake to a real internet host every time.
+        self._client = httpx.AsyncClient(timeout=self.timeout)
 
     async def generate(self, prompt: str) -> BackendResponse:
         if not self.api_key:
@@ -125,10 +147,9 @@ class GeminiBackend(Backend):
         # their message, so a key-in-URL would leak the secret into any
         # error output. A header never appears in that message.
         headers = {"x-goog-api-key": self.api_key, "Content-Type": "application/json"}
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(self.url, headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+        resp = await self._client.post(self.url, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"]
         return BackendResponse(text=text, model_name=self.model)
 
@@ -158,6 +179,9 @@ class GroqBackend(Backend):
         self.api_key = api_key
         self.timeout = timeout
         self.url = "https://api.groq.com/openai/v1/chat/completions"
+        # Shared across every generate() call - see OllamaBackend's __init__
+        # for the full reasoning.
+        self._client = httpx.AsyncClient(timeout=self.timeout)
 
     async def generate(self, prompt: str) -> BackendResponse:
         if not self.api_key:
@@ -172,10 +196,9 @@ class GroqBackend(Backend):
             "Content-Type": "application/json",
         }
         payload = {"model": self.model, "messages": [{"role": "user", "content": prompt}]}
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(self.url, headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+        resp = await self._client.post(self.url, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
 
         text = data["choices"][0]["message"]["content"]
         usage = data.get("usage", {})

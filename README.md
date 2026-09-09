@@ -202,6 +202,8 @@ The gateway tries three backends in a fixed order, stopping at the first success
 
 **On API keys:** `GeminiBackend` sends its key via the `x-goog-api-key` header and `GroqBackend` via a `Bearer` token in `Authorization` — never as a URL query parameter for either. httpx exceptions (and anything that logs them) include the request URL in their message; a key-in-URL would leak the secret into ordinary error output the moment a call to that backend ever failed. A header never appears in that message.
 
+**Connection reuse:** each backend instance holds one shared `httpx.AsyncClient` across its whole lifetime (constructed once in `__init__`, closed via `aclose()` in `main.py`'s `lifespan()` on shutdown) rather than opening a brand-new client - and paying for a fresh TCP/TLS handshake - on every single `generate()` call. `self.base_url`/`self.url` are still read fresh per call from the instance, not baked into the client, so `test_failover.py`'s runtime monkeypatching of those attributes to simulate a failure still works exactly as before - verified by re-running it after this change (6/6 checks still pass, including both real induced failovers).
+
 ## Results & verification
 
 ### Benchmark results (5 independent runs)
@@ -233,7 +235,7 @@ One robustness issue surfaced by running the batch 5 times instead of once: on a
 
 ### Phase 1: health endpoint, request tracing, input validation, cache persistence
 
-**`GET /health`** checks Ollama (a lightweight `/api/tags` call, not a generation) and each cloud backend (a models-list call) without touching the cache, router, or DB. Real output with all three backends up:
+**`GET /health`** checks Ollama (a lightweight `/api/tags` call, not a generation) and each cloud backend (a models-list call) without touching the cache, router, or DB. The three checks run concurrently (`asyncio.gather`), not one after another - each has its own 5-second timeout, so a sequential worst case (all three actually timing out) took up to 15 seconds for one `/health` call; concurrently, the same worst case takes ~5 seconds instead. Real output with all three backends up:
 ```
 {"gateway":"up","ollama":"up","gemini":"up","groq":"up","cache_size":0}
 ```

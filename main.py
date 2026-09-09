@@ -69,6 +69,7 @@ logged to gateway.db (a second, deliberate gap alongside /chat's
 all-backends-failed 502 path - see README's Known Limitations).
 """
 
+import asyncio
 import json
 import os
 import pickle
@@ -231,6 +232,11 @@ async def lifespan(app: FastAPI):
     saved = await cache.save()
     if saved:
         print(f"Saved {saved} cache entries to disk (cache_state.json/.npz)")
+    # Each backend holds one shared httpx.AsyncClient across its whole
+    # lifetime now (see backends.py) instead of a new one per call - release
+    # its connection pool cleanly on shutdown rather than letting it leak.
+    for backend in (*ollama_backends.values(), gemini_backend, groq_backend):
+        await backend.aclose()
 
 
 app = FastAPI(title="LLM Gateway MVP", lifespan=lifespan)
@@ -251,51 +257,58 @@ class ChatResponse(BaseModel):
     request_id: str
 
 
-@app.get("/health")
-async def health() -> dict:
-    """
-    Lightweight reachability check for both backends - lists models rather
-    than generating anything, so it's fast and doesn't cost CPU/quota.
-    Doesn't touch the cache, router, or DB; this is purely "can we reach
-    these two services right now".
-    """
-    ollama_status = "down"
+async def _check_ollama_health() -> str:
     try:
         async with httpx.AsyncClient(timeout=HEALTH_CHECK_TIMEOUT_SECONDS) as client:
             resp = await client.get(OLLAMA_TAGS_URL)
-            if resp.status_code == 200:
-                ollama_status = "up"
+            return "up" if resp.status_code == 200 else "down"
     except Exception:
-        ollama_status = "down"
+        return "down"
 
+
+async def _check_gemini_health() -> str:
     if not GEMINI_API_KEY:
-        gemini_status = "unconfigured"
-    else:
-        gemini_status = "down"
-        try:
-            async with httpx.AsyncClient(timeout=HEALTH_CHECK_TIMEOUT_SECONDS) as client:
-                resp = await client.get(
-                    GEMINI_MODELS_URL, headers={"x-goog-api-key": GEMINI_API_KEY}
-                )
-                if resp.status_code == 200:
-                    gemini_status = "up"
-        except Exception:
-            gemini_status = "down"
+        return "unconfigured"
+    try:
+        async with httpx.AsyncClient(timeout=HEALTH_CHECK_TIMEOUT_SECONDS) as client:
+            resp = await client.get(
+                GEMINI_MODELS_URL, headers={"x-goog-api-key": GEMINI_API_KEY}
+            )
+            return "up" if resp.status_code == 200 else "down"
+    except Exception:
+        return "down"
 
+
+async def _check_groq_health() -> str:
     if not GROQ_API_KEY:
-        groq_status = "unconfigured"
-    else:
-        groq_status = "down"
-        try:
-            async with httpx.AsyncClient(timeout=HEALTH_CHECK_TIMEOUT_SECONDS) as client:
-                resp = await client.get(
-                    GROQ_MODELS_URL, headers={"Authorization": f"Bearer {GROQ_API_KEY}"}
-                )
-                if resp.status_code == 200:
-                    groq_status = "up"
-        except Exception:
-            groq_status = "down"
+        return "unconfigured"
+    try:
+        async with httpx.AsyncClient(timeout=HEALTH_CHECK_TIMEOUT_SECONDS) as client:
+            resp = await client.get(
+                GROQ_MODELS_URL, headers={"Authorization": f"Bearer {GROQ_API_KEY}"}
+            )
+            return "up" if resp.status_code == 200 else "down"
+    except Exception:
+        return "down"
 
+
+@app.get("/health")
+async def health() -> dict:
+    """
+    Lightweight reachability check for all three backends - lists models
+    rather than generating anything, so it's fast and doesn't cost
+    CPU/quota. Doesn't touch the cache, router, or DB; this is purely "can
+    we reach these three services right now".
+
+    The three checks run concurrently (asyncio.gather), not one after
+    another: each has its own HEALTH_CHECK_TIMEOUT_SECONDS=5.0 timeout, so
+    a sequential worst case (all three actually timing out) took up to 15s
+    for one /health call; concurrently, the same worst case takes ~5s -
+    however long the single slowest check takes, not the sum of all three.
+    """
+    ollama_status, gemini_status, groq_status = await asyncio.gather(
+        _check_ollama_health(), _check_gemini_health(), _check_groq_health()
+    )
     return {
         "gateway": "up",
         "ollama": ollama_status,
