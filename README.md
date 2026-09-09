@@ -142,7 +142,7 @@ Opens at `http://localhost:8501`. Reads `gateway.db` directly — the gateway se
 - [`test_failover.py`](test_failover.py) — standalone test script for the full three-tier failover chain
 - [`test_streaming.py`](test_streaming.py) — real client test for `POST /chat/stream`, timestamping every SSE chunk to confirm tokens actually arrive incrementally
 - [`test_rate_limit.py`](test_rate_limit.py) — standalone test script for the rate limiter (unit-level + endpoint wiring)
-- [`analyze_ollama_stats.py`](analyze_ollama_stats.py) — breaks down Ollama's own load/eval timing per model from `gateway.db`
+- [`analyze_ollama_stats.py`](analyze_ollama_stats.py) — breaks down Ollama's own load/eval timing per model from `gateway.db`, explicitly excluding (and reporting the count of) any Gemini/Groq failover rows a miss-only query would otherwise mis-attribute as Ollama timing
 - [`aggregate_benchmark_runs.py`](aggregate_benchmark_runs.py) — combines several `benchmark.py` runs' printed summaries into one table with min/max/avg speedup and hit rate
 - [`cost_estimate.py`](cost_estimate.py) — estimates what this project's real token volume would have cost on paid hosted APIs, versus $0 for local Ollama calls
 - [`generate_eval_set.py`](generate_eval_set.py) — router evaluation harness: runs 50 prompts through both local models directly and writes [`eval_set.csv`](eval_set.csv) for manual quality judging (generation only — it does not judge)
