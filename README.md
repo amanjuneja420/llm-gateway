@@ -117,6 +117,12 @@ venv\Scripts\python train_classifier.py
 ```
 Prints cross-validated accuracy and a heuristic-vs-classifier comparison, and saves `router_classifier.pkl`. Once that file exists, `POST /chat?router=trained` opts a request into the trained router instead of the default heuristic — see "Trained routing classifier" under "Results & verification" for why the heuristic stays the default.
 
+**11. (Optional) view the dashboard:**
+```bash
+venv\Scripts\streamlit run dashboard.py
+```
+Opens at `http://localhost:8501`. Reads `gateway.db` directly — the gateway server doesn't need to be running.
+
 ## Project structure
 
 - [`main.py`](main.py) — the FastAPI app: `POST /chat`, `GET /health`, request validation, request-ID tracing, and the failover chain, all wired together
@@ -135,6 +141,7 @@ Prints cross-validated accuracy and a heuristic-vs-classifier comparison, and sa
 - [`cost_estimate.py`](cost_estimate.py) — estimates what this project's real token volume would have cost on paid hosted APIs, versus $0 for local Ollama calls
 - [`generate_eval_set.py`](generate_eval_set.py) — router evaluation harness: runs 50 prompts through both local models directly and writes [`eval_set.csv`](eval_set.csv) for manual quality judging (generation only — it does not judge)
 - [`train_classifier.py`](train_classifier.py) — trains and cross-validates a routing classifier on the hand-judged `eval_set.csv`, compares it against `router.py`'s heuristic, and saves [`router_classifier.pkl`](router_classifier.pkl)
+- [`dashboard.py`](dashboard.py) — read-only Streamlit dashboard over `gateway.db`: request volume, model usage, cache hit rate, latency by model
 - `runs/` — raw `gateway.db` snapshot from each `benchmark.py` run (`gateway_run_<UTC timestamp>.db`), archived automatically before the next run wipes the live `gateway.db`
 - `gateway.db` — the committed SQLite log; currently a reference snapshot from one full benchmark run (Run 3, see below), kept so the results below are re-derivable rather than just asserted
 - `.env` (not committed — see `.env.example`) — holds `GEMINI_API_KEY` and `GROQ_API_KEY`, loaded at startup via `python-dotenv`
@@ -414,6 +421,17 @@ Every single one of 747 chunks arrived at a measurably later timestamp than the 
 
 **A second unlogged path, alongside `/chat`'s all-backends-failed 502 (see Known Limitations):** if the client disconnects mid-stream, ASGI tears the generator down via `GeneratorExit` at whichever `yield` it was suspended on, which propagates straight past the cache-write and `log_request()` call at the end of `event_stream()` - a disconnected stream is never cached or logged. This was verified by accident during testing: an early version of `test_streaming.py` crashed mid-stream on a Windows console encoding error partway through receiving a response containing "H₂O", and the gateway's `cache_size` stayed at 0 afterward - exactly the documented behavior, not a bug in the endpoint.
 
+### Read-only dashboard (`dashboard.py`)
+
+[`dashboard.py`](dashboard.py) is a small Streamlit app that reads `gateway.db` directly - no dependency on the gateway server being up, no writes, no new columns. It shows request volume over time (auto-bucketed by minute/hour/day depending on how wide the loaded data's time span actually is), a model usage split, a `served_by` breakdown, cache hit rate, and average latency by model. No new dependencies beyond Streamlit itself, per the brief - `pandas` is imported because Streamlit's own chart functions consume it under the hood, not because this file chose to add a second dependency.
+
+Verified for real against the live server at `localhost:8501` (screenshotted, not just imported and assumed to work), against two different `gateway.db` files:
+
+- **The committed Run 3 snapshot** (30 rows, all predating the `served_by` column): the `served_by breakdown` chart correctly showed 100% of rows as `"not recorded (pre-migration)"`, with an explanatory caption underneath rather than a chart that just looks broken or empty.
+- **A mixed file** (the same 30 rows plus 25 real rows from `load_test.py`'s run, which does have `served_by` populated): the chart correctly split into `30 not recorded` / `25 ollama`, and every other chart (volume-over-time bucketing switched automatically from minute to hour once the data spanned almost 2 days, model usage, cache hit rate, latency by model) updated correctly too.
+
+**The "rate-limit rejection count" the brief asked for is always a labeled zero, not a real measurement.** `main.py`'s `chat()` raises the 429 before `log_request()` is ever called - the same reasoning as the all-backends-failed 502 path (see Known Limitations) - so there is no query against `gateway.db` that can recover how many requests were actually rate-limited. The dashboard shows `"0 (by design)"` with a tooltip explaining why, rather than a real-looking `0` that would misleadingly suggest rate limiting never fired (`load_test.py`'s own run triggered 4 real 429s that same day - they just aren't, and can't be, in this table). Getting a real count would mean adding a second logging call to `chat()`'s 429 branch specifically for this dashboard; not done here since it wasn't asked for, flagged instead of silently faked.
+
 ## Known limitations
 
 - **A request where all three backends fail is not logged anywhere.** The `502` path in `chat()` returns before calling `log_request()` — confirmed both by code inspection and by a live test with all three backends pointed at unreachable addresses (no `gateway.db` row was written). Every other outcome (cache hit, any successful tier, even a 400 from validation happening before this point) either logs or was never a "the system tried and failed" event in the first place; this one specific path is the exception, stated here rather than implied away.
@@ -429,4 +447,5 @@ Every single one of 747 chunks arrived at a measurably later timestamp than the 
 ## What I'd build next
 
 - More labeled routing examples — the real bottleneck for the trained classifier, not a different model or algorithm. A few hundred judged prompts, not 49, is the next thing to try before concluding a learned router can't help here.
-- A small dashboard over `gateway.db` instead of querying it by hand
+- A real fix for the cache's concurrency race (a per-prompt-hash lock, or an in-flight-request registry) — see Known Limitations
+- A real rate-limit-rejection count in the dashboard, which means adding a second log call to `chat()`'s 429 branch specifically for it
