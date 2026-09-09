@@ -144,4 +144,7 @@ st.divider()
 
 # --- Raw data ---------------------------------------------------------------
 with st.expander("Raw data (last 100 rows)"):
-    st.dataframe(df.tail(100), use_container_width=True)
+    # width="stretch" not use_container_width=True (deprecated in this
+    # installed streamlit version - see the "will be removed after
+    # 2025-12-31" warning it prints otherwise).
+    st.dataframe(df.tail(100), width="stretch")

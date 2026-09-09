@@ -19,9 +19,13 @@ flowchart TD
     V -->|"yes"| B["Embed prompt<br/>(all-MiniLM-L6-v2)"]
     B --> C{"Semantic cache lookup<br/>cosine similarity"}
     C -->|"similarity >= 0.92"| D["Return cached response<br/>served_by=cache, failed_over=false"]
-    C -->|"similarity < 0.92"| E["Heuristic router<br/>picks model"]
-    E -->|"short/simple"| F["qwen2.5:1.5b (Ollama)"]
-    E -->|"long/complex"| G["qwen2.5:3b (Ollama)"]
+    C -->|"similarity < 0.92"| E{"?router= query param"}
+    E -->|"heuristic (default)"| E1["Heuristic router<br/>picks model"]
+    E -->|"trained (opt-in)"| E2["Classifier picks model<br/>falls back to heuristic if no .pkl"]
+    E1 --> F["qwen2.5:1.5b (Ollama)"]
+    E1 --> G["qwen2.5:3b (Ollama)"]
+    E2 --> F
+    E2 --> G
     F --> H1{"Ollama succeeds?"}
     G --> H1
     H1 -->|"yes"| ST["Store in cache<br/>+ persist to disk"]
@@ -32,7 +36,7 @@ flowchart TD
     H3 -->|"no"| ERR["502: all backends failed<br/>(not logged to gateway.db)"]
     ST --> K["Log to SQLite (gateway.db)<br/>incl. request_id, served_by"]
     D --> K
-    K --> L["Return {response, model_used, cache_hit,<br/>latency_ms, failed_over, served_by, request_id}"]
+    K --> L["Return {response, model_used, cache_hit,<br/>latency_ms, failed_over, served_by,<br/>router_mode, request_id}"]
 ```
 
 Cache hits skip the model call entirely and go straight to the log. Cache misses go through the router, then a three-tier failover chain — Ollama first, then Gemini, then Groq — stopping at the first success; Gemini and Groq are never routing options the heuristic picks on its own, only fallbacks for when Ollama's call actually fails. Every successful path, hit or miss, ends up logged before the response goes back; a request where all three backends fail is the one path that returns without being logged (see "Known limitations"). `GET /health` is a separate, lightweight endpoint that checks reachability of all three backends without going through any of this.
@@ -107,13 +111,13 @@ venv\Scripts\python aggregate_benchmark_runs.py   # combine multiple benchmark r
 venv\Scripts\python cost_estimate.py              # what this token volume would cost on paid APIs
 ```
 
-**9. (Optional, slow — ~35 minutes on CPU) generate the router evaluation set:**
+**9. (Optional, slow — ~35 minutes on CPU, and skippable — see warning) generate the router evaluation set:**
 ```bash
 venv\Scripts\python generate_eval_set.py
 ```
-Runs 50 prompts through both models directly (bypassing the router) and writes `eval_set.csv` for manual quality judging — see "Results & verification".
+Runs 50 prompts through both models directly (bypassing the router) and writes `eval_set.csv` for manual quality judging — see "Results & verification". **Skip this step on a fresh clone unless you intend to redo the manual judging yourself**: the committed `eval_set.csv` already has real `which_is_better` judgments in it (that's what step 10 below actually trains on), and this script opens its output file in `"w"` mode — running it overwrites those judgments with a fresh, empty-`which_is_better` file, unrecoverable unless you `git checkout eval_set.csv` afterward.
 
-**10. (Optional) Train and evaluate the routing classifier**, once `eval_set.csv`'s `which_is_better` column is filled in by hand:
+**10. Train and evaluate the routing classifier** on the already-judged `eval_set.csv` (no need to run step 9 first — the judgments are already committed):
 ```bash
 venv\Scripts\python train_classifier.py
 ```
@@ -127,7 +131,7 @@ Opens at `http://localhost:8501`. Reads `gateway.db` directly — the gateway se
 
 ## Project structure
 
-- [`main.py`](main.py) — the FastAPI app: `POST /chat`, `GET /health`, request validation, request-ID tracing, and the failover chain, all wired together
+- [`main.py`](main.py) — the FastAPI app: `POST /chat`, `POST /chat/stream`, `GET /health`, request validation, request-ID tracing, rate limiting, and the failover chain, all wired together
 - [`backends.py`](backends.py) — the `Backend` interface (`generate(prompt) -> BackendResponse`) and its three implementations: `OllamaBackend`, `GeminiBackend`, `GroqBackend`
 - [`rate_limiter.py`](rate_limiter.py) — the token-bucket rate limiter, one bucket per client key
 - [`router.py`](router.py) — the heuristic model router (no I/O, pure function)
@@ -144,7 +148,7 @@ Opens at `http://localhost:8501`. Reads `gateway.db` directly — the gateway se
 - [`generate_eval_set.py`](generate_eval_set.py) — router evaluation harness: runs 50 prompts through both local models directly and writes [`eval_set.csv`](eval_set.csv) for manual quality judging (generation only — it does not judge)
 - [`train_classifier.py`](train_classifier.py) — trains and cross-validates a routing classifier on the hand-judged `eval_set.csv`, compares it against `router.py`'s heuristic, and saves [`router_classifier.pkl`](router_classifier.pkl)
 - [`dashboard.py`](dashboard.py) — read-only Streamlit dashboard over `gateway.db`: request volume, model usage, cache hit rate, latency by model
-- `runs/` — raw `gateway.db` snapshot from each `benchmark.py` run (`gateway_run_<UTC timestamp>.db`), archived automatically before the next run wipes the live `gateway.db`
+- `runs/` — raw `gateway.db` snapshots archived automatically before something else would overwrite the live `gateway.db`: `gateway_run_<timestamp>.db` from `benchmark.py`, `gateway_load_test_<timestamp>.db` from `load_test.py` (which also restores the clean Run 3 snapshot afterward — see "Real concurrent load test")
 - `gateway.db` — the committed SQLite log; currently a reference snapshot from one full benchmark run (Run 3, see below), kept so the results below are re-derivable rather than just asserted
 - `.env` (not committed — see `.env.example`) — holds `GEMINI_API_KEY` and `GROQ_API_KEY`, loaded at startup via `python-dotenv`
 - `cache_state.npz` / `cache_state.json` (not committed) — the semantic cache's persisted state, written after every new entry and reloaded on startup
@@ -160,7 +164,7 @@ Opens at `http://localhost:8501`. Reads `gateway.db` directly — the gateway se
 
 If either signal fires, the prompt goes to `qwen2.5:3b`; otherwise `qwen2.5:1.5b`.
 
-**Why a heuristic instead of a trained classifier:** given the time I had, a heuristic is instant to run (no inference cost of its own), fully transparent (every routing decision can be explained by pointing at the exact line of code that made it), and needs zero training data or evaluation harness to trust. A trained router could route more accurately in principle, but that requires labeled examples of which model *should* have handled a given prompt, plus its own accuracy evaluation. I've since built and run that full path — see "Trained routing classifier (experimental)" under "Results & verification" for the real numbers — and the honest result is that ~49 labeled examples wasn't enough for it to actually beat this heuristic. The heuristic stays the default; the trained classifier is available as an explicit opt-in, not a replacement.
+**Why a heuristic instead of a trained classifier:** given the time I had, a heuristic is instant to run (no inference cost of its own), fully transparent (every routing decision can be explained by pointing at the exact line of code that made it), and needs zero training data or evaluation harness to trust. A trained router could route more accurately in principle, but that requires labeled examples of which model *should* have handled a given prompt, plus its own accuracy evaluation. I've since built and run that full path — see "Trained routing classifier (experimental, opt-in only)" under "Results & verification" for the real numbers — and the honest result is that ~49 labeled examples wasn't enough for it to actually beat this heuristic. The heuristic stays the default; the trained classifier is available as an explicit opt-in, not a replacement.
 
 ### The semantic cache, its similarity threshold, and persistence
 
@@ -195,6 +199,33 @@ The gateway tries three backends in a fixed order, stopping at the first success
 **On API keys:** `GeminiBackend` sends its key via the `x-goog-api-key` header and `GroqBackend` via a `Bearer` token in `Authorization` — never as a URL query parameter for either. httpx exceptions (and anything that logs them) include the request URL in their message; a key-in-URL would leak the secret into ordinary error output the moment a call to that backend ever failed. A header never appears in that message.
 
 ## Results & verification
+
+### Benchmark results (5 independent runs)
+
+The cache-hit speedup multiplier turned out to vary noticeably run-to-run on this shared, CPU-only machine (778x in the first clean run, 400x in a later one) — that's background CPU load changing the *absolute* miss latency, not noise in the cache itself (hit latency stays consistently in the tens-to-hundreds of milliseconds regardless of load). To report an honest number instead of cherry-picking one run, `benchmark.py` was run 5 separate times, each against a freshly restarted server (empty cache, fresh `gateway.db`, same 30-prompt set every time, `keep_alive: 30m` on every Ollama call so models stay resident):
+
+```
+====================================================================================================
+                               COMBINED BENCHMARK RESULTS ACROSS RUNS
+====================================================================================================
+Run                                            n  hit rate   avg hit ms   avg miss ms   speedup
+----------------------------------------------------------------------------------------------------
+Run A (section 5, first clean run)            30     20.0%         35.3       27489.6    778.7x
+Run B (post-instrumentation re-run)           30     20.0%         90.5       36146.5    399.4x
+Run 1 (multi-run set)                         30     20.0%         63.0       43214.6    685.9x
+Run 2 (multi-run set, 1 request timed out)    29     20.7%         61.3       39310.3    641.3x
+Run 3 (multi-run set)                         30     20.0%         91.7       40389.6    440.5x
+----------------------------------------------------------------------------------------------------
+Speedup (miss/hit) across runs              min=  399.4x   max=  778.7x   avg=  589.2x
+Cache hit rate across runs                  min=  20.0%   max=  20.7%   avg=  20.1%
+====================================================================================================
+```
+
+**Headline result: cache hits were consistently 400x-780x faster than live model generation across 5 runs (average: ~589x).** Cache hit rate was stable at ~20% every time (the same 30-prompt set with the same 6 intended paraphrase hits; run 2 lost one request to a timeout unrelated to the cache — see below — leaving 29 logged instead of 30, hence 20.7% instead of 20.0%). The exact speedup multiple depends on how loaded the CPU is at the moment (it swings the *miss* latency around, from ~27s to ~43s average across these runs) but the qualitative result — a cache hit costs tens to low-hundreds of milliseconds regardless of load, a real model call costs tens of seconds — held in every single run. This table is reproduced by [`aggregate_benchmark_runs.py`](aggregate_benchmark_runs.py); the 3 newest runs' raw per-request output is in [`benchmark_run_1.log`](benchmark_run_1.log), [`benchmark_run_2.log`](benchmark_run_2.log), [`benchmark_run_3.log`](benchmark_run_3.log).
+
+One robustness issue surfaced by running the batch 5 times instead of once: on a sufficiently loaded run, a single `qwen2.5:3b` call can exceed `main.py`'s own 120s httpx timeout to Ollama (run 2, request 23) and return a 500. `benchmark.py` catches this per-request and logs a `FAIL` line instead of crashing the whole batch — a real gap this repeated-run exercise caught that a single run wouldn't have.
+
+**Known limitation on reproducibility, stated plainly rather than hidden:** the archiving mechanism (`runs/gateway_run_<timestamp>.db`) didn't exist yet when Runs A, B, 1, 2, and 3 were executed, so all five are transcribed from that session's printed summaries/logs rather than re-derivable from a preserved raw `gateway.db`. Run 3's raw data happened to still be sitting in `gateway.db` (nothing had wiped it yet) when the archiving script was added, so it was copied into `runs/` retroactively as `gateway_run_20260907T125043Z.db` — Runs A, B, 1, and 2 have no raw snapshot and never will. From the *next* `benchmark.py` invocation onward, the script copies `gateway.db` to `runs/gateway_run_<UTC timestamp>.db` itself immediately after printing its summary, before the next run's fresh restart wipes it — so every run from Run 3 onward is fully re-derivable from raw per-request rows (including the `load_duration_ms` / `eval_count` / `eval_duration_ms` instrumentation), not just its printed summary. See "Known limitations" below for the same point stated in that section's own words.
 
 ### Phase 1: health endpoint, request tracing, input validation, cache persistence
 
@@ -272,7 +303,7 @@ If ALL of this volume had instead gone to a paid API:
 
 [`generate_eval_set.py`](generate_eval_set.py) bypasses `router.py` entirely and runs both `qwen2.5:1.5b` and `qwen2.5:3b` directly on the same 50 prompts — 20 deduplicated unique questions from `benchmark.py`'s 30-prompt set (its paraphrase groups exist to test the cache, not model quality, so only one phrasing per question was kept) plus 30 new prompts spanning domains `benchmark.py` doesn't touch (math, biology, CS/data structures, economics, literature). Output is [`eval_set.csv`](eval_set.csv): `prompt`, `response_1.5b`, `response_3b`, and an empty `which_is_better` column.
 
-Real evidence from an actual run, in [`eval_generation.log`](eval_generation.log): all 50 prompts × 2 models = 100 real generations succeeded (zero errors), taking **34.7 minutes (2081s) total** on this CPU-only machine — individual `qwen2.5:3b` calls ran up to 103 seconds. Confirmed before committing: `which_is_better` is empty on all 50 rows. This script only generates; **judging which model answered better, by hand, is separate work not done by this script or by me** — see "What I'd build next".
+Real evidence from an actual run, in [`eval_generation.log`](eval_generation.log): all 50 prompts × 2 models = 100 real generations succeeded (zero errors), taking **34.7 minutes (2081s) total** on this CPU-only machine — individual `qwen2.5:3b` calls ran up to 103 seconds. Confirmed before committing: `which_is_better` is empty on all 50 rows at this stage. This script only generates — judging which model answered better, by hand, was separate work, done afterward and used to train an actual routing classifier on top of it — see "Trained routing classifier (experimental, opt-in only)" below.
 
 ### Rate limiting
 
@@ -306,7 +337,7 @@ RATE LIMIT TEST SUMMARY
 
 The test swaps in a smaller/faster limiter (3 requests / 3 seconds instead of production's 10/60) so it finishes in seconds — the 429 message above correctly reports `3 requests per 3s` because it reads `capacity`/`window_seconds` off whichever `RateLimiter` instance is actually live, not off the module-level defaults, a real bug the first version of this test caught (the message used to always say "10 requests per 60s" regardless of which limiter was actually enforcing the check).
 
-**A real interaction worth knowing about:** [`benchmark.py`](benchmark.py) sends no `X-API-Key` header, so all 30 of its requests share the single `"anonymous"` bucket. At the default 10/60s, a fresh benchmark run can burn through the initial 10-request burst well within a minute and start hitting `429`s partway through. `benchmark.py`'s own per-request error handling (see the benchmark-crash incident note earlier in this section) will catch these as `FAIL` lines and keep going rather than crash, but the resulting hit-rate/latency numbers from a fresh run would no longer match the 5-run table above without either raising the limit, giving the benchmark its own header, or exempting it. Not fixed here since it wasn't asked for — flagged so a future re-run's numbers aren't a surprise.
+**A real interaction worth knowing about:** [`benchmark.py`](benchmark.py) sends no `X-API-Key` header, so all 30 of its requests share the single `"anonymous"` bucket. At the default 10/60s, a fresh benchmark run can burn through the initial 10-request burst well within a minute and start hitting `429`s partway through. `benchmark.py`'s own per-request error handling (see the timeout/`FAIL`-line note under "Benchmark results (5 independent runs)" above) will catch these as `FAIL` lines and keep going rather than crash, but the resulting hit-rate/latency numbers from a fresh run would no longer match the 5-run table above without either raising the limit, giving the benchmark its own header, or exempting it. Not fixed here since it wasn't asked for — flagged so a future re-run's numbers aren't a surprise.
 
 ### Real concurrent load test
 
@@ -442,7 +473,7 @@ Verified for real against the live server at `localhost:8501` (screenshotted, no
 - **The semantic cache has no size cap or eviction policy.** Persistence (see "Design decisions") means it also no longer resets on restart, which is progress, but the trade-off is that it now grows unbounded for as long as it keeps getting new entries — nothing prunes old or rarely-hit entries.
 - **Runs A, B, 1, and 2 (of the original 5-run benchmark set) have no preserved raw database.** The archiving mechanism (`runs/gateway_run_<timestamp>.db`) didn't exist yet when those were executed, so their numbers are transcribed from that session's printed summaries/logs, not re-derivable from a raw `gateway.db`. Every benchmark run from Run 3 onward is fully re-derivable from raw per-request rows instead.
 - **Everything was measured on one CPU-only machine** (Intel integrated graphics, no CUDA). The routing split and cache speedup direction should generalize; the absolute millisecond numbers are specific to this hardware and clearly move around with background load even on this one machine (see the benchmark's 400x–780x spread).
-- **The router is still a heuristic by default, and the trained alternative doesn't clearly beat it yet.** The full harness now exists end to end — generation, manual judging, cross-validated training, and an opt-in `?router=trained` mode — but at 49 labeled examples the classifier collapsed to a majority-class predictor rather than learning a real signal (see "Trained routing classifier" above). More labeled data is the actual next step, not a different model or algorithm.
+- **The router is still a heuristic by default, and the trained alternative doesn't clearly beat it yet.** The full harness now exists end to end — generation, manual judging, cross-validated training, and an opt-in `?router=trained` mode — but at 49 labeled examples the classifier collapsed to a majority-class predictor rather than learning a real signal (see "Trained routing classifier (experimental, opt-in only)" above). More labeled data is the actual next step, not a different model or algorithm.
 - **The failover chain is a simple ordered retry, not a circuit breaker** — no failure counter, no cooldown, no half-open state. It only ever reacts to the one request in front of it, at every tier.
 - **No Docker, Kubernetes, or deployment/CI-CD setup**, and no load balancing across multiple local model replicas. These were left out deliberately rather than forgotten — this was a time-boxed solo project, and I don't have hands-on deployment experience I could back up in an interview yet if asked to defend those choices.
 
