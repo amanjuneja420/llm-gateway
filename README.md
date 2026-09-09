@@ -4,7 +4,7 @@ A local LLM gateway that routes prompts between two Ollama models by a heuristic
 
 ## What this is
 
-This is a single FastAPI endpoint (`POST /chat`) sitting in front of two Ollama models running on my own machine: a small one (`qwen2.5:1.5b`) for simple prompts and a bigger one (`qwen2.5:3b`) for longer or more complex ones. Before calling either, it checks a semantic cache so a near-duplicate of a prompt it's already answered doesn't trigger another model call. If the routed local call fails or times out, it retries through a chain of cloud fallbacks — Gemini, then Groq — instead of just erroring out. Every request — hit, miss, or failover — gets logged to SQLite with a per-request ID, so the numbers in this README come from querying that log, not from memory. There's also a `GET /health` endpoint, basic input validation, per-client rate limiting, and a cache that survives a restart.
+This is a FastAPI gateway (`POST /chat`, plus a streaming `POST /chat/stream`) sitting in front of two Ollama models running on my own machine: a small one (`qwen2.5:1.5b`) for simple prompts and a bigger one (`qwen2.5:3b`) for longer or more complex ones. Before calling either, it checks a semantic cache so a near-duplicate of a prompt it's already answered doesn't trigger another model call. If the routed local call fails or times out, it retries through a chain of cloud fallbacks — Gemini, then Groq — instead of just erroring out. Every request — hit, miss, or failover — gets logged to SQLite with a per-request ID, so the numbers in this README come from querying that log, not from memory. There's also a `GET /health` endpoint, basic input validation, per-client rate limiting, a cache that survives a restart, a genuinely-concurrent load test that found and documents a real race condition, and a read-only Streamlit dashboard over the request log.
 
 ## Why I built this
 
@@ -36,6 +36,8 @@ flowchart TD
 ```
 
 Cache hits skip the model call entirely and go straight to the log. Cache misses go through the router, then a three-tier failover chain — Ollama first, then Gemini, then Groq — stopping at the first success; Gemini and Groq are never routing options the heuristic picks on its own, only fallbacks for when Ollama's call actually fails. Every successful path, hit or miss, ends up logged before the response goes back; a request where all three backends fail is the one path that returns without being logged (see "Known limitations"). `GET /health` is a separate, lightweight endpoint that checks reachability of all three backends without going through any of this.
+
+`POST /chat/stream` follows the same cache check and rate limiting shown above, but diverges after a cache miss: it talks to Ollama directly with token streaming instead of entering the failover chain, and it doesn't support `?router=trained` — see "SSE streaming" under "Results & verification" for why it's scoped narrower than `/chat` on purpose, not left out of this diagram by oversight.
 
 ## Quick start
 
